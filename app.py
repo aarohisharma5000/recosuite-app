@@ -1080,16 +1080,23 @@ df2 = normalize_cols(df2)
 st.session_state["df1"] = df1
 st.session_state["df2"] = df2
 # ── FREE PLAN ROW LIMIT CHECK ──
+# ── FREE PLAN ROW LIMIT CHECK ──
 if st.session_state.get("user_plan","free") == "free":
     _total = len(df1) + len(df2)
-    if _total > 100:
-        st.warning(f"⚠️ Free plan: Your files have {_total:,} rows. Free allows 100 rows only. Showing first 50 rows per side.")
-        st.info("🔒 [Upgrade to ₹299](https://aarohisharma5000.github.io/recosuite) for unlimited rows.")
-        df1 = df1.head(50)
-        df2 = df2.head(50)
+    if _total > 200:
+        st.markdown("""
+        <div style="background:#fff3cd; border:1px solid #ffc107; border-radius:12px;
+                    padding:1rem 1.5rem; margin:0.5rem 0;">
+            <b>🆓 Free Plan — Demo Mode</b><br>
+            Showing first <b>100 rows from each file</b> for preview.
+            Your files have <b>{:,} rows</b> total.
+            Full reconciliation available on paid plans.
+        </div>
+        """.format(_total), unsafe_allow_html=True)
+        df1 = df1.head(100)
+        df2 = df2.head(100)
         st.session_state["df1"] = df1
         st.session_state["df2"] = df2
-
 common_cols = sorted(list(set(df1.columns).intersection(set(df2.columns))))
 internal_cols = {"_SOURCE_FILE", "_KEY", "_merge", "_SHEET"}
 matched_cols = [c for c in common_cols if c not in internal_cols]
@@ -2462,6 +2469,36 @@ if not skip_recompute:
     k5.metric("Only in File1", f"{len(only_f1_out):,}")
     k6.metric("Only in File2", f"{len(only_f2_out):,}")
     k7.metric("Duplicate Keys (union)", f"{len(dup_union):,}")
+
+    # ── UPGRADE POPUP FOR FREE USERS ──
+if st.session_state.get("user_plan","free") == "free":
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0a1628,#0f2040);
+                border:1px solid rgba(0,212,255,0.3); border-radius:16px;
+                padding:1.5rem 2rem; margin:1rem 0; text-align:center;">
+        <div style="font-size:1.1rem; font-weight:800; color:#00d4ff; margin-bottom:0.5rem;">
+            🔒 You are viewing Demo Results (100 rows only)
+        </div>
+        <div style="color:rgba(255,255,255,0.7); font-size:0.9rem; margin-bottom:1rem;">
+            Your actual files have thousands of rows. Upgrade to see complete reconciliation,
+            all downloads, and PDF reports.
+        </div>
+        <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
+            <a href="https://aarohisharma5000.github.io/recosuite"
+               target="_blank"
+               style="background:#ffd600; color:#1a1a00; padding:0.7rem 2rem;
+                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
+                ⭐ Upgrade — ₹299 for 6 months
+            </a>
+            <a href="https://wa.me/919818799197?text=RecoSuite%20Subscribe"
+               target="_blank"
+               style="background:#25D366; color:white; padding:0.7rem 2rem;
+                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
+                💬 WhatsApp to Subscribe
+            </a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
     st.subheader("4) Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
@@ -2527,6 +2564,35 @@ if has_cached_run:
     k4.metric("Only in File1", f"{len(only_f1_out):,}")
     k5.metric("Only in File2", f"{len(only_f2_out):,}")
     k6.metric("Duplicate Keys (union)", f"{len(pd.Index(dup_rows_1_out.get('_KEY', pd.Series([]))).unique()):,}")
+    # ── UPGRADE POPUP FOR FREE USERS ──
+if st.session_state.get("user_plan","free") == "free":
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0a1628,#0f2040);
+                border:1px solid rgba(0,212,255,0.3); border-radius:16px;
+                padding:1.5rem 2rem; margin:1rem 0; text-align:center;">
+        <div style="font-size:1.1rem; font-weight:800; color:#00d4ff; margin-bottom:0.5rem;">
+            🔒 You are viewing Demo Results (100 rows only)
+        </div>
+        <div style="color:rgba(255,255,255,0.7); font-size:0.9rem; margin-bottom:1rem;">
+            Your actual files have thousands of rows. Upgrade to see complete reconciliation,
+            all downloads, and PDF reports.
+        </div>
+        <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
+            <a href="https://aarohisharma5000.github.io/recosuite"
+               target="_blank"
+               style="background:#ffd600; color:#1a1a00; padding:0.7rem 2rem;
+                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
+                ⭐ Upgrade — ₹299 for 6 months
+            </a>
+            <a href="https://wa.me/919818799197?text=RecoSuite%20Subscribe"
+               target="_blank"
+               style="background:#25D366; color:white; padding:0.7rem 2rem;
+                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
+                💬 WhatsApp to Subscribe
+            </a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     st.subheader("4) Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
