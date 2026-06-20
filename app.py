@@ -78,7 +78,7 @@ show_help = False
 
 APP_VERSION  = "v1.6"
 LAST_UPDATED = "2026-03-23"
-COMPANY_NAME = "Reconciliation Suite"
+COMPANY_NAME = "RecoSuite"
 
 # ---------- Title ----------
 st.title(f"📌 {COMPANY_NAME} • Reconciliation Tool (Multi-File Upload) • {APP_VERSION}")
@@ -87,7 +87,7 @@ st.title(f"📌 {COMPANY_NAME} • Reconciliation Tool (Multi-File Upload) • {
 st.info(
     f"🟢 **Version:** {APP_VERSION}   |   "
     f"🕒 **Last Updated:** {LAST_UPDATED}   |   "
-    f"💻 Runs locally on your machine (localhost)",
+    f"☁️ Powered by RecoSuite Cloud",
     icon="ℹ️"
 )
 
@@ -126,9 +126,7 @@ st.markdown(
     </style>
 
     <div class="footer">
-        <b>{COMPANY_NAME}</b> · Internal Use Only · Data stays on your machine (local processing).
-        Do not share outputs externally without approval.
-        If issues occur, Connect :  Finance Ops. at aarohisharma5000@gmail.com
+        <b>RecoSuite</b> · Smart Reconciliation Tool · Support: aarohisharma5000@gmail.com · <a href="https://wa.me/919818799197" style="color:#0d6efd;">WhatsApp</a>
     </div>
     """,
     unsafe_allow_html=True
