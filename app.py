@@ -29,15 +29,42 @@ gc     = gspread.authorize(creds)
 sheet  = gc.open_by_key(st.secrets["SHEET_ID"]).sheet1
 rows   = sheet.get_all_records()
 user_email = st.query_params.get("email", "")
+user_pin   = st.query_params.get("pin", "")
+
 if not user_email:
+    st.markdown("""...""")
+    st.stop()
     st.error("❌ Access denied. Contact aarohisharma5000@gmail.com for your link.")
     st.stop()
 user_row = next((r for r in rows if str(r.get("email","")).strip().lower() == user_email.strip().lower()), None)
 if not user_row:
-    st.error(f"❌ {user_email} is not subscribed."); st.stop()
+    st.error(f"❌ {user_email} is not subscribed.")
+    st.stop()
+
 expiry = date.fromisoformat(str(user_row["expiry_date"]))
 if expiry < date.today():
-    st.error(f"⏰ Subscription expired on {expiry}. Please renew."); st.stop()
+    st.error(f"⏰ Subscription expired on {expiry}. Please renew.")
+    st.stop()
+
+# ── PIN CHECK ──
+correct_pin = str(user_row.get("pin","")).strip()
+if correct_pin and user_pin != correct_pin:
+    st.markdown("""
+    <div style="text-align:center; padding:3rem 2rem;">
+        <div style="font-size:2rem; margin-bottom:1rem;">🔐</div>
+        <h2 style="color:#0a1628;">Enter Your PIN</h2>
+        <p style="color:#666; margin-bottom:1.5rem;">Enter the 4-digit PIN sent to you with your subscription link.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    pin_input = st.text_input("Enter PIN", type="password", max_chars=6, placeholder="Enter your PIN...")
+    if st.button("🔓 Access Tool", type="primary"):
+        if pin_input.strip() == correct_pin:
+            st.query_params["pin"] = pin_input.strip()
+            st.rerun()
+        else:
+            st.error("❌ Incorrect PIN. Please check your subscription email.")
+    st.stop()
+# ── PIN PASSED ──    
 plan = str(user_row.get("plan","free")).strip().lower()
 ROW_LIMIT = {"free":100,"starter":250000,"pro":9999999}.get(plan,100)
 st.session_state["user_plan"] = plan
