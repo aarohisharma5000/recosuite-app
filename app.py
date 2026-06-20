@@ -2182,7 +2182,7 @@ if not skip_recompute:
                 s2x = df[c2]
                 eq = s1x.astype(str) == s2x.astype(str)
                 if treat_blanks_as_equal:
-                    eq = eq | (s1x.apply(is_blank) & s2x.apply(is_blank))
+                    eq = eq | (s1x.apply(is_blank).astype(bool) & s2x.apply(is_blank).astype(bool))
                 df[f"Match_{col}_f1=f2"] = eq
 
         return df
