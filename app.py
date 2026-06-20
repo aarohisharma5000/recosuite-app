@@ -96,7 +96,7 @@ st.markdown(f"""
 <div class="reco-header">
   <div>
     <div class="reco-logo">Reco<span>Suite</span></div>
-    <div class="reco-user">👤 {_email if _email else "RecoSuite Customer App"}</div>
+    <div class="reco-user">👤 {st.query_params.get("email", "")}</div>
   </div>
   {"<div class='reco-plan'>" + _plan_label + "</div>" if _plan_label else ""}
 </div>
@@ -112,7 +112,7 @@ LAST_UPDATED = "2026-03-23"
 COMPANY_NAME = "RecoSuite"
 
 # ---------- Title ----------
-st.title(f"📌 {COMPANY_NAME} • Reconciliation Tool (Multi-File Upload) • {APP_VERSION}")
+st.markdown(f"#### 📌 Reconciliation Tool (Multi-File Upload) &nbsp; `{APP_VERSION}`")
 
 # ---------- Version Banner ----------
 st.info(
