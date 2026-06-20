@@ -68,8 +68,39 @@ from reportlab.lib.pagesizes import A4, landscape
 
 st.set_page_config(page_title="Reco Tool", layout="wide")
 
-# ✅ Help moved to Launcher — no duplicate toggle in Tool 1
+# ✅ Help moved to Launcher
 show_help = False
+
+# ── NAVY HEADER ──
+import streamlit as st
+_plan = st.session_state.get("user_plan", "")
+_email = st.session_state.get("user_email", "")
+_plan_label = {"free":"🆓 Free — 100 rows","starter":"⭐ Starter Plan","pro":"🏆 Pro Plan"}.get(_plan,"")
+st.markdown(f"""
+<style>
+  .reco-header {{
+    display:flex; align-items:center; justify-content:space-between;
+    background:linear-gradient(135deg,#0a1628,#0f2040);
+    border-radius:16px; padding:1rem 2rem; margin-bottom:1rem;
+    border:1px solid rgba(0,212,255,0.2);
+  }}
+  .reco-logo {{ font-size:1.4rem; font-weight:900; color:#00d4ff; }}
+  .reco-logo span {{ color:white; }}
+  .reco-user {{ color:rgba(255,255,255,0.6); font-size:0.8rem; margin-top:0.2rem; }}
+  .reco-plan {{
+    background:rgba(0,212,255,0.15); border:1px solid rgba(0,212,255,0.3);
+    color:#00d4ff; padding:0.3rem 1rem; border-radius:50px;
+    font-size:0.82rem; font-weight:700;
+  }}
+</style>
+<div class="reco-header">
+  <div>
+    <div class="reco-logo">Reco<span>Suite</span></div>
+    <div class="reco-user">👤 {_email if _email else "RecoSuite Customer App"}</div>
+  </div>
+  {"<div class='reco-plan'>" + _plan_label + "</div>" if _plan_label else ""}
+</div>
+""", unsafe_allow_html=True)
 
 
 # ============================================================
