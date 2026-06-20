@@ -2526,33 +2526,32 @@ if st.session_state.get("user_plan","free") == "free":
         </div>
     </div>
     """, unsafe_allow_html=True)
-    st.subheader("4) Summary")
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+st.subheader("4) Summary")
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
+st.subheader("5) Outputs")
+tabs = st.tabs([
+    "✅ Matched", "❌ Mismatched", "⬅ Only in File 1", "➡ Only in File 2",
+    "🟡 Dup_File1", "🟡 Dup_File2", "🟠 Dup_Both", "🧾 Run Log"
+])
 
-    st.subheader("5) Outputs")
-    tabs = st.tabs([
-        "✅ Matched", "❌ Mismatched", "⬅ Only in File 1", "➡ Only in File 2",
-        "🟡 Dup_File1", "🟡 Dup_File2", "🟠 Dup_Both", "🧾 Run Log"
-    ])
-
-    with tabs[0]:
-        st.dataframe(matched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[1]:
-        st.dataframe(mismatched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[2]:
-        st.dataframe(only_f1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[3]:
-        st.dataframe(only_f2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[4]:
-        st.dataframe(dup_rows_1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[5]:
-        st.dataframe(dup_rows_2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[6]:
-        st.dataframe(dup_both_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[7]:
-        # ✅ Run Log tab — shows step-by-step execution log
-        _log = st.session_state.get("run_log_lines", [])
-        st.code("\n".join(_log) if _log else "No log available yet.", language="text")
+with tabs[0]:
+    st.dataframe(matched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[1]:
+    st.dataframe(mismatched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[2]:
+    st.dataframe(only_f1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[3]:
+    st.dataframe(only_f2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[4]:
+    st.dataframe(dup_rows_1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[5]:
+    st.dataframe(dup_rows_2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[6]:
+    st.dataframe(dup_both_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[7]:
+    # ✅ Run Log tab — shows step-by-step execution log
+    _log = st.session_state.get("run_log_lines", [])
+    st.code("\n".join(_log) if _log else "No log available yet.", language="text")
 
     # -----------------------------
     # ✅ Save Run outputs to session cache (prevents rerun recompute on downloads)
@@ -2621,31 +2620,31 @@ if st.session_state.get("user_plan","free") == "free":
     </div>
     """, unsafe_allow_html=True)
 
-    st.subheader("4) Summary")
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+st.subheader("4) Summary")
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    st.subheader("5) Outputs")
-    tabs = st.tabs([
-        "✅ Matched", "❌ Mismatched", "⬅ Only in File 1", "➡ Only in File 2",
-        "🟡 Dup_File1", "🟡 Dup_File2", "🟠 Dup_Both", "🧾 Run Log"
-    ])
-    with tabs[0]:
-        st.dataframe(matched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[1]:
-        st.dataframe(mismatched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[2]:
-        st.dataframe(only_f1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[3]:
-        st.dataframe(only_f2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[4]:
-        st.dataframe(dup_rows_1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[5]:
-        st.dataframe(dup_rows_2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[6]:
-        st.dataframe(dup_both_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-    with tabs[7]:
-        _log = st.session_state.get("run_log_lines", [])
-        st.code("\n".join(_log) if _log else "No log available (cached run).", language="text")
+st.subheader("5) Outputs")
+tabs = st.tabs([
+    "✅ Matched", "❌ Mismatched", "⬅ Only in File 1", "➡ Only in File 2",
+    "🟡 Dup_File1", "🟡 Dup_File2", "🟠 Dup_Both", "🧾 Run Log"
+])
+with tabs[0]:
+    st.dataframe(matched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[1]:
+    st.dataframe(mismatched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[2]:
+    st.dataframe(only_f1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[3]:
+    st.dataframe(only_f2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[4]:
+    st.dataframe(dup_rows_1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[5]:
+    st.dataframe(dup_rows_2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[6]:
+    st.dataframe(dup_both_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
+with tabs[7]:
+    _log = st.session_state.get("run_log_lines", [])
+    st.code("\n".join(_log) if _log else "No log available (cached run).", language="text")
 
 out_summary_pdf = Path("summary_report_tool1.pdf")
 # -----------------------------
