@@ -979,13 +979,7 @@ with col2:
 if not (f1_list and f2_list):
     st.info("Upload at least 1 file on both sides to start.")
     st.stop()
-# ── FREE PLAN ROW LIMIT CHECK ──
-if st.session_state.get("user_plan","free") == "free":
-    _total = len(df1) + len(df2)
-    if _total > 100:
-        st.warning(f"⚠️ Free plan allows 100 rows total. Your files have {_total:,} rows. Showing first 50 rows per side only.")
-        df1 = df1.head(50)
-        df2 = df2.head(50)    
+
 
 # -----------------------------
 # Read ONCE (per upload set)
@@ -1085,6 +1079,16 @@ df1 = normalize_cols(df1)
 df2 = normalize_cols(df2)
 st.session_state["df1"] = df1
 st.session_state["df2"] = df2
+# ── FREE PLAN ROW LIMIT CHECK ──
+if st.session_state.get("user_plan","free") == "free":
+    _total = len(df1) + len(df2)
+    if _total > 100:
+        st.warning(f"⚠️ Free plan: Your files have {_total:,} rows. Free allows 100 rows only. Showing first 50 rows per side.")
+        st.info("🔒 [Upgrade to ₹299](https://aarohisharma5000.github.io/recosuite) for unlimited rows.")
+        df1 = df1.head(50)
+        df2 = df2.head(50)
+        st.session_state["df1"] = df1
+        st.session_state["df2"] = df2
 
 common_cols = sorted(list(set(df1.columns).intersection(set(df2.columns))))
 internal_cols = {"_SOURCE_FILE", "_KEY", "_merge", "_SHEET"}
