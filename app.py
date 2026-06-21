@@ -2590,62 +2590,7 @@ if has_cached_run:
     k4.metric("Only in File1", f"{len(only_f1_out):,}")
     k5.metric("Only in File2", f"{len(only_f2_out):,}")
     k6.metric("Duplicate Keys (union)", f"{len(pd.Index(dup_rows_1_out.get('_KEY', pd.Series([]))).unique()):,}")
-    # ── UPGRADE POPUP FOR FREE USERS ──
-if st.session_state.get("user_plan","free") == "free":
-    st.markdown("""
-    <div style="background:linear-gradient(135deg,#0a1628,#0f2040);
-                border:1px solid rgba(0,212,255,0.3); border-radius:16px;
-                padding:1.5rem 2rem; margin:1rem 0; text-align:center;">
-        <div style="font-size:1.1rem; font-weight:800; color:#00d4ff; margin-bottom:0.5rem;">
-            🔒 You are viewing Demo Results (100 rows only)
-        </div>
-        <div style="color:rgba(255,255,255,0.7); font-size:0.9rem; margin-bottom:1rem;">
-            Your actual files have thousands of rows. Upgrade to see complete reconciliation,
-            all downloads, and PDF reports.
-        </div>
-        <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
-            <a href="https://aarohisharma5000.github.io/recosuite"
-               target="_blank"
-               style="background:#ffd600; color:#1a1a00; padding:0.7rem 2rem;
-                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
-                ⭐ Upgrade — ₹299 for 6 months
-            </a>
-            <a href="https://wa.me/919818799197?text=RecoSuite%20Subscribe"
-               target="_blank"
-               style="background:#25D366; color:white; padding:0.7rem 2rem;
-                      border-radius:50px; font-weight:800; text-decoration:none; font-size:1rem;">
-                💬 WhatsApp to Subscribe
-            </a>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-st.subheader("4) Summary")
-st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-st.subheader("5) Outputs")
-tabs = st.tabs([
-    "✅ Matched", "❌ Mismatched", "⬅ Only in File 1", "➡ Only in File 2",
-    "🟡 Dup_File1", "🟡 Dup_File2", "🟠 Dup_Both", "🧾 Run Log"
-])
-with tabs[0]:
-    st.dataframe(matched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[1]:
-    st.dataframe(mismatched_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[2]:
-    st.dataframe(only_f1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[3]:
-    st.dataframe(only_f2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[4]:
-    st.dataframe(dup_rows_1_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[5]:
-    st.dataframe(dup_rows_2_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[6]:
-    st.dataframe(dup_both_out.head(int(show_rows_in_browser)), use_container_width=True, hide_index=True)
-with tabs[7]:
-    _log = st.session_state.get("run_log_lines", [])
-    st.code("\n".join(_log) if _log else "No log available (cached run).", language="text")
-
+    
 out_summary_pdf = Path("summary_report_tool1.pdf")
 # -----------------------------
 # Step 7/7: Download (CSV + Excel)
