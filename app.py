@@ -417,28 +417,39 @@ def is_text_by_name(col: str) -> bool:
     return any(k in lc for k in TEXT_NAME_KEYWORDS)
 
 def is_numeric_column(df_both: pd.DataFrame, col: str) -> bool:
-    if is_text_by_name(col):
+    try:
+        if is_text_by_name(col):
+            return False
+
+        c1 = f"{col}_f1"
+        c2 = f"{col}_f2"
+        if c1 not in df_both.columns or c2 not in df_both.columns:
+            return False
+
+        if df_both.empty:
+            return False
+
+        s1 = df_both[c1]
+        s2 = df_both[c2]
+
+        if len(s1) == 0 or len(s2) == 0:
+            return False
+
+        nb1 = ~s1.apply(is_blank)
+        nb2 = ~s2.apply(is_blank)
+
+        n1 = pd.to_numeric(s1, errors="coerce")
+        n2 = pd.to_numeric(s2, errors="coerce")
+
+        nb1_sum = int(nb1.sum()) if hasattr(nb1.sum(), '__int__') else 1
+        nb2_sum = int(nb2.sum()) if hasattr(nb2.sum(), '__int__') else 1
+
+        r1 = float((n1.notna() & nb1).sum()) / max(1, nb1_sum)
+        r2 = float((n2.notna() & nb2).sum()) / max(1, nb2_sum)
+
+        return (r1 >= 0.80) and (r2 >= 0.80)
+    except Exception:
         return False
-
-    c1 = f"{col}_f1"
-    c2 = f"{col}_f2"
-    if c1 not in df_both.columns or c2 not in df_both.columns:
-        return False
-
-    s1 = df_both[c1]
-    s2 = df_both[c2]
-
-    nb1 = ~s1.apply(is_blank)
-    nb2 = ~s2.apply(is_blank)
-
-    n1 = pd.to_numeric(s1, errors="coerce")
-    n2 = pd.to_numeric(s2, errors="coerce")
-
-    r1 = (n1.notna() & nb1).sum() / max(1, int(nb1.sum()))
-    r2 = (n2.notna() & nb2).sum() / max(1, int(nb2.sum()))
-
-    return (r1 >= 0.80) and (r2 >= 0.80)
-
 # -----------------------------
 # KEY cleaning (STRONG) + COALESCE (CASE-INSENSITIVE)
 # -----------------------------
