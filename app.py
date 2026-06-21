@@ -1265,13 +1265,16 @@ else:
                     key=f"colmap_{i}_{f1_col}",
                     label_visibility="collapsed"
                 )
+                # ✅ FIX: update session_state directly per key
                 if _sel != "— Skip —":
-                    _new_mapping[f1_col] = _sel
+                    st.session_state["col_mapping"][f1_col] = _sel
+                elif f1_col in st.session_state["col_mapping"]:
+                    del st.session_state["col_mapping"][f1_col]
 
             st.markdown("<div style='height:2px'></div>", unsafe_allow_html=True)
 
-        st.session_state["col_mapping"] = _new_mapping
-
+        
+        _new_mapping = dict(st.session_state["col_mapping"])
         if _new_mapping:
             st.markdown("#### ✅ Active Mappings")
             st.dataframe(
