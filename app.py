@@ -1963,9 +1963,11 @@ if not skip_recompute:
     dup_rows_1 = df1_raw[df1_raw["_KEY"].isin(dup_keys_1)].copy()
     dup_rows_2 = df2_raw[df2_raw["_KEY"].isin(dup_keys_2)].copy()
 
-    dup_rows_1.insert(0, "Source", "File1")
-    dup_rows_2.insert(0, "Source", "File2")
-
+    if "Source" not in dup_rows_1.columns:
+        dup_rows_1.insert(0, "Source", "File1")
+    if "Source" not in dup_rows_2.columns:
+        dup_rows_2.insert(0, "Source", "File2")
+        
     dup_rows_1 = dup_rows_1.sort_values(["_KEY"])
     dup_rows_2 = dup_rows_2.sort_values(["_KEY"])
 
@@ -1982,8 +1984,12 @@ if not skip_recompute:
 
     dup_both_1 = df1_raw[df1_raw["_KEY"].isin(dup_both_keys)].copy()
     dup_both_2 = df2_raw[df2_raw["_KEY"].isin(dup_both_keys)].copy()
-    dup_both_1.insert(0, "Source", "File1")
-    dup_both_2.insert(0, "Source", "File2")
+    
+    if "Source" not in dup_both_1.columns:
+        dup_both_1.insert(0, "Source", "File1")
+    if "Source" not in dup_both_2.columns:
+        dup_both_2.insert(0, "Source", "File2")
+    
     dup_both = pd.concat([dup_both_1, dup_both_2], ignore_index=True).sort_values(["_KEY", "Source"])
 
     # show which candidate columns exist (for duplicate tab columns)
