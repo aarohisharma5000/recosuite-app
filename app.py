@@ -434,8 +434,8 @@ def is_numeric_column(df_both: pd.DataFrame, col: str) -> bool:
     n1 = pd.to_numeric(s1, errors="coerce")
     n2 = pd.to_numeric(s2, errors="coerce")
 
-    r1 = (n1.notna() & nb1).sum() / max(1, nb1.sum())
-    r2 = (n2.notna() & nb2).sum() / max(1, nb2.sum())
+    r1 = (n1.notna() & nb1).sum() / max(1, int(nb1.sum()))
+    r2 = (n2.notna() & nb2).sum() / max(1, int(nb2.sum()))
 
     return (r1 >= 0.80) and (r2 >= 0.80)
 
