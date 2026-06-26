@@ -2187,13 +2187,13 @@ if not skip_recompute:
         tol = float(numeric_tolerance)
         mismatch = (n1 - n2).abs() > (tol + 1e-9)
         if treat_blanks_as_equal:
-            mismatch = mismatch & (~(s1.apply(is_blank) & s2.apply(is_blank)))
+            mismatch = mismatch & (~(s1.apply(is_blank).astype(bool) & s2.apply(is_blank).astype(bool)))
     else:
         s1s = s1.astype(str)
         s2s = s2.astype(str)
         mismatch = (s1s != s2s)
         if treat_blanks_as_equal:
-            mismatch = mismatch & (~(s1.apply(is_blank) & s2.apply(is_blank)))
+            mismatch = mismatch & (~(s1.apply(is_blank).astype(bool) & s2.apply(is_blank).astype(bool)))
 
     both["Mismatch_Count"] = mismatch.astype(int)
     if skip_mismatch_columns:
