@@ -2009,13 +2009,17 @@ if not skip_recompute:
             if c not in seen:
                 seen.add(c)
                 cols2_dedup.append(c)
-        return dfx[cols2_dedup].copy()
+        result = dfx[cols2_dedup].copy()
+        result = result.loc[:, ~result.columns.duplicated()]
+        return result
 
     dup_rows_1_out = _filter_dup_df(dup_rows_1)
     dup_rows_2_out = _filter_dup_df(dup_rows_2)
     dup_both_out   = _filter_dup_df(dup_both)
 
     # ✅ FIX: deduplicate dup outputs to ONE ROW PER KEY (for cleaner downloads)
+
+    
     # Keep only first occurrence of each duplicate key in each side
     if not dup_rows_1_out.empty and "_KEY" in dup_rows_1_out.columns:
         dup_rows_1_out = dup_rows_1_out.drop_duplicates(subset=["_KEY"], keep="first").copy()
