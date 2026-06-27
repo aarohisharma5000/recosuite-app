@@ -1965,8 +1965,12 @@ if not skip_recompute:
 
     if "Source" not in dup_rows_1.columns:
         dup_rows_1.insert(0, "Source", "File1")
+    # ✅ FIX: remove duplicate columns before filtering
+    dup_rows_1 = dup_rows_1.loc[:, ~dup_rows_1.columns.duplicated()]
     if "Source" not in dup_rows_2.columns:
         dup_rows_2.insert(0, "Source", "File2")
+    # ✅ FIX: remove duplicate columns before filtering
+    dup_rows_2 = dup_rows_2.loc[:, ~dup_rows_2.columns.duplicated()]
         
     dup_rows_1 = dup_rows_1.sort_values(["_KEY"])
     dup_rows_2 = dup_rows_2.sort_values(["_KEY"])
@@ -1991,6 +1995,7 @@ if not skip_recompute:
         dup_both_2.insert(0, "Source", "File2")
     
     dup_both = pd.concat([dup_both_1, dup_both_2], ignore_index=True).sort_values(["_KEY", "Source"])
+    dup_both = dup_both.loc[:, ~dup_both.columns.duplicated()]
 
     # show which candidate columns exist (for duplicate tab columns)
     existing_keys_for_display = [c for c in KEY_CANDIDATES_PRIORITY if (c in df1_raw.columns or c in df2_raw.columns)]
