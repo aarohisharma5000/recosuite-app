@@ -169,11 +169,40 @@ if st.session_state.get("plan_unrecognised"):
     st.warning(f'Plan "{st.session_state["plan_unrecognised"]}" not recognised, so Free limits apply. '
                f'Please contact support: aarohisharma5000@gmail.com')
 
+# ✅ v1.7.2: multiselect chips wrap onto multiple lines and show their full text (all multiselects).
+#    Backup for wrap_multiselect(): covers the newer Streamlit multiselect (react-aria, data-testid hooks)
+#    and the older BaseWeb one. Only stable data-testid / data-baseweb / role hooks are used.
+st.markdown("""
+<style>
+[data-testid="stMultiSelect"] [role="group"]:has(> [data-testid="stMultiSelectTagsContainer"]) {
+    max-height: none !important; height: auto !important;
+}
+[data-testid="stMultiSelect"] [data-testid="stMultiSelectTagsContainer"] {
+    flex-wrap: wrap !important; overflow: visible !important; max-height: none !important;
+    -webkit-mask-image: none !important; mask-image: none !important;
+}
+[data-testid="stMultiSelect"] [data-testid="stMultiSelectTagsContainer"] > span[role="group"] {
+    display: contents;
+}
+[data-testid="stMultiSelect"] [data-testid="stMultiSelectTagsContainer"] span {
+    max-width: none !important; text-overflow: clip !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+[data-testid="stMultiSelect"] [data-baseweb="select"] > div > div:first-child {
+    flex-wrap: wrap !important; max-height: none !important; overflow: visible !important;
+}
+[data-testid="stMultiSelect"] [data-baseweb="tag"],
+[data-testid="stMultiSelect"] [data-baseweb="tag"] span {
+    max-width: none !important; text-overflow: clip !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================================================
 # 🔹 App Meta + Layout (PASTE ONCE, NEVER TOUCH AGAIN)
 # ============================================================
 
-APP_VERSION  = "v1.7.1"
+APP_VERSION  = "v1.7.2"
 LAST_UPDATED = "2026-10-20"
 COMPANY_NAME = "RecoSuite"
 
@@ -709,6 +738,18 @@ def read_many(files, settings: dict = None):
     return combined, summary
 
 
+def wrap_multiselect(*args, **kwargs):
+    """✅ v1.7.2: st.multiselect whose selected chips WRAP onto several lines (all visible).
+    Streamlit >= 1.62 shows chips on one clipped, horizontally scrolling row in many layouts (e.g. inside
+    st.columns); wrap=True restores multi-line chips. Older Streamlit has no `wrap` argument, so fall back."""
+    try:
+        return st.multiselect(*args, wrap=True, **kwargs)
+    except TypeError as e:
+        if "wrap" not in str(e):
+            raise
+        return st.multiselect(*args, **kwargs)
+
+
 def file_settings_ui(side_label: str, side_key: str, files) -> dict:
     """
     ✅ NEW: compact per-side '⚙️ File settings' expander.
@@ -778,7 +819,7 @@ def file_settings_ui(side_label: str, side_key: str, files) -> dict:
             rows = {s["sheet"]: s["rows"] for s in info}
             st.markdown(f"**{e['name']}**")
             if picker:
-                sel = st.multiselect(
+                sel = wrap_multiselect(
                     "Sheets to use",
                     options=non_empty,
                     default=default,
@@ -1902,7 +1943,7 @@ for c in auto_suggest:
         _seen_default.add(c)
         _safe_default.append(c)
 
-key_cols_sel = st.multiselect(
+key_cols_sel = wrap_multiselect(
     "Select key column(s) — COALESCE priority follows order below",
     options=_dedup(common_cols),
     default=_safe_default
@@ -2112,12 +2153,13 @@ with c2:
     default_sel = default_compare_selection(common_cols)
 
     if compare_mode == "Compare selected columns":
-        compare_cols = st.multiselect(
+        compare_cols = wrap_multiselect(
             "Select columns to compare (must exist in both)",
             common_cols,
             default=default_sel if default_sel else (common_cols[:7] if len(common_cols) >= 7 else common_cols)
         )
         compare_cols = reorder_selected_cols(compare_cols)
+        st.caption(f"{len(compare_cols)} column{'' if len(compare_cols) == 1 else 's'} selected")   # ✅ v1.7.2
         reco_focus_col = st.selectbox(
             "Summary 'Particular' column (choose ONE from selected columns)",
             options=compare_cols if compare_cols else common_cols,
@@ -2223,7 +2265,7 @@ if filter_enabled:
             st.info("Showing first 5,000 unique values. You can still type values manually below.")
         if not _fvals:
             st.info("No values found for this column.")
-        picked_values = st.multiselect(
+        picked_values = wrap_multiselect(
             "Pick filter value(s) (case-insensitive match)",
             options=_fvals,
             default=[]
