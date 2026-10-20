@@ -23,10 +23,14 @@ from google.oauth2.service_account import Credentials
 from datetime import date
 import streamlit as st
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+# ✅ v1.8: read/write Sheets scope (was spreadsheets.readonly) so templates can be saved in the "templates" tab.
+#    The service account must have EDITOR access to the subscriber spreadsheet.
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 creds  = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 gc     = gspread.authorize(creds)
-sheet  = gc.open_by_key(st.secrets["SHEET_ID"]).sheet1
+spreadsheet = gc.open_by_key(st.secrets["SHEET_ID"])
+sheet  = spreadsheet.sheet1
+TEMPLATE_SPREADSHEET = spreadsheet   # 📋 v1.8: templates worksheet lives in this spreadsheet
 # ✅ FIX: read every cell as TEXT so PINs like "0123" keep their leading zero
 try:
     rows = sheet.get_all_records(numericise_ignore=["all"])
@@ -101,6 +105,7 @@ ROW_LIMIT = {"free":100,"basic":250000,"starter":250000,"pro":9999999}.get(plan,
 st.session_state["plan_unrecognised"] = None if _plan_ok else str(_plan_raw).strip()[:40]
 st.session_state["user_plan"] = plan
 st.session_state["row_limit"] = ROW_LIMIT
+st.session_state["auth_email"] = str(user_row.get("email", "")).strip().lower()   # 📋 verified login email (templates are stored per this)
 # ── AUTH PASSED ──
 
 import io
@@ -108,6 +113,7 @@ import time
 import re
 import csv        # ✅ NEW v1.7: CSV preview for header detection
 import hashlib    # ✅ NEW v1.7: content hash for the per-file parse cache
+import os, json, fnmatch   # 📋 v1.8 templates
 import pandas as pd
 import streamlit as st
 
@@ -119,7 +125,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from pathlib import Path
 
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
@@ -202,7 +208,7 @@ st.markdown("""
 # 🔹 App Meta + Layout (PASTE ONCE, NEVER TOUCH AGAIN)
 # ============================================================
 
-APP_VERSION  = "v1.7.2"
+APP_VERSION  = "v1.8"
 LAST_UPDATED = "2026-10-20"
 COMPANY_NAME = "RecoSuite"
 
@@ -819,10 +825,11 @@ def file_settings_ui(side_label: str, side_key: str, files) -> dict:
             rows = {s["sheet"]: s["rows"] for s in info}
             st.markdown(f"**{e['name']}**")
             if picker:
+                _sanitize_state_list(f"sheets|{base_key}", non_empty)
                 sel = wrap_multiselect(
                     "Sheets to use",
                     options=non_empty,
-                    default=default,
+                    **_kw_if_new(f"sheets|{base_key}", default=default),
                     format_func=lambda s, _r=rows: f"{s} ({_r.get(s) or 0:,} rows)",
                     key=f"sheets|{base_key}",
                     help="Rows from the selected sheets are combined. Default = the largest sheet plus sheets with the same headers.",
@@ -841,7 +848,8 @@ def file_settings_ui(side_label: str, side_key: str, files) -> dict:
                 d1 = int(det.get(sh, 0)) + 1
                 hv = st.number_input(
                     "Header row" if sh == "CSV" or len(sel) == 1 else f"Header row: {sh}",
-                    min_value=1, max_value=100000, value=d1, step=1,
+                    min_value=1, max_value=100000, step=1,
+                    **_kw_if_new(f"hdr|{base_key}|{sh}", value=d1),
                     key=f"hdr|{base_key}|{sh}",
                     help="Row number (1 = first row) that has the column names. Rows above it are ignored.",
                 )
@@ -849,7 +857,647 @@ def file_settings_ui(side_label: str, side_key: str, files) -> dict:
                 st.caption(f"Header detected on row {d1}" + ("" if hv == d1 else f" · using row {hv}"))
                 headers[sh] = hv - 1
             settings[e["key"]] = {"sheets": list(sel), "headers": headers}
+    # 📋 file info for templates (names, sheets) — used by the Apply-template callback on the next run
+    st.session_state[f"_tpl_files_{side_key}"] = [
+        {"base_key": bk, "name": e["name"], "sheets": list(ne), "picker": bool(pk),
+         "sheets_used": list(settings.get(e["key"], {}).get("sheets", []))}
+        for e, bk, ne, _d, pk, _s, _h in plan_]
     return settings
+
+
+# ============================================================
+# 📋 SAVED TEMPLATES (v1.8): save the reco setup once, re-apply it next month
+# ============================================================
+# Storage: a 'templates' worksheet in the SAME subscriber spreadsheet (auto-created).
+#   Columns: email | template_name | created_at | updated_at | json   (one template per row, JSON per row)
+#   Only rows whose email == the PIN-verified login email are ever read or written.
+# Shared demo account + any Sheets problem (no edit access, quota, network) -> templates live in this
+# browser session only, with .json download/upload so nothing is lost.
+TEMPLATE_SCHEMA = "recosuite.template/1"
+TEMPLATE_MAX_BYTES = 200_000                    # uploaded .json file limit
+TEMPLATE_CELL_LIMIT = 49_000                    # Google Sheets cell limit is 50,000 characters
+TEMPLATE_LIMITS = {"free": 1, "paid": 50}
+TEMPLATE_WS_TITLE = "templates"
+TEMPLATE_COLUMNS = ["email", "template_name", "created_at", "updated_at", "json"]
+TEMPLATE_CACHE_TTL = 60                         # seconds; per session, invalidated on save/delete
+TEMPLATE_RETRY_AFTER = 120                      # seconds to wait before trying the sheet again after an error
+DEMO_EMAILS = {"demo@recosuite.com"}            # shared trial login -> session-only templates
+IST = timezone(timedelta(hours=5, minutes=30), "IST")
+_TPL_W = "tpl_w_"                               # prefix of widget keys a template can set
+SUPPORT_EMAIL = "aarohisharma5000@gmail.com"
+
+
+def now_ist_str() -> str:
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+
+
+class TemplateStoreError(Exception):
+    """kind: 'permission' | 'quota' | 'network' | 'format' | 'size' | 'other'. user_msg is safe to show."""
+
+    def __init__(self, kind: str, user_msg: str):
+        super().__init__(user_msg)
+        self.kind = kind
+        self.user_msg = user_msg
+
+
+def _classify_store_error(e: Exception) -> TemplateStoreError:
+    if isinstance(e, TemplateStoreError):
+        return e
+    code = getattr(getattr(e, "response", None), "status_code", None) or getattr(e, "code", None)
+    name = type(e).__name__
+    text = str(e)[:300].upper()
+    if code in (401, 403) or "PERMISSION" in text or name in ("PermissionError",):
+        return TemplateStoreError("permission", "Templates need edit access to the subscriber sheet. Please contact support: "
+                                  + SUPPORT_EMAIL + ". For now you can download/upload templates as .json files.")
+    if code == 429 or "RATE_LIMIT" in text or "QUOTA" in text:
+        return TemplateStoreError("quota", "Template storage (Google Sheets) is busy right now. Please try again in a minute. "
+                                  "Meanwhile you can download/upload templates as .json files.")
+    if name in ("ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout", "TransportError") or (isinstance(code, int) and code >= 500):
+        return TemplateStoreError("network", "Couldn't reach template storage (Google Sheets). Please try again later. "
+                                  "Meanwhile you can download/upload templates as .json files.")
+    return TemplateStoreError("other", "Template storage is not available right now. You can download/upload templates as .json files.")
+
+
+def _col_letter(n: int) -> str:
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+class SessionTemplateStore:
+    """Templates kept in THIS browser session only (demo account / storage unavailable)."""
+    persistent = False
+
+    def _bucket(self, email):
+        allb = st.session_state.setdefault("_tpl_session_store", {})
+        return allb.setdefault(str(email).strip().lower(), {})
+
+    def list(self, email):
+        return dict(self._bucket(email))
+
+    def save(self, email, tpl):
+        t = dict(tpl)
+        old = self._bucket(email).get(t["name"])
+        t["created"] = (old or {}).get("created") or now_ist_str()
+        t["updated"] = now_ist_str()
+        self._bucket(email)[t["name"]] = t
+
+    def delete(self, email, name):
+        self._bucket(email).pop(name, None)
+
+
+class SheetTemplateStore:
+    """'templates' worksheet in the subscriber spreadsheet. Reads are cached per session for 60 s;
+    writes always re-read the sheet first and verify the target row before changing it."""
+    persistent = True
+
+    def __init__(self, spreadsheet):
+        self.ss = spreadsheet
+
+    # --- worksheet + header ---
+    def _ws(self):
+        ck = "_tpl_ws_obj"
+        ws = st.session_state.get(ck)
+        if ws is not None:
+            return ws
+        try:
+            ws = self.ss.worksheet(TEMPLATE_WS_TITLE)
+        except Exception as e:
+            if type(e).__name__ != "WorksheetNotFound":
+                raise
+            ws = self.ss.add_worksheet(title=TEMPLATE_WS_TITLE, rows=100, cols=len(TEMPLATE_COLUMNS))
+            ws.update(values=[TEMPLATE_COLUMNS], range_name=f"A1:{_col_letter(len(TEMPLATE_COLUMNS))}1")
+        st.session_state[ck] = ws
+        return ws
+
+    def _read(self):
+        """Returns (ws, header_index, data_rows_with_sheet_row_numbers). Fresh read (no cache)."""
+        ws = self._ws()
+        vals = ws.get_all_values() or []
+        if not vals or not any(str(c).strip() for c in vals[0]):
+            ws.update(values=[TEMPLATE_COLUMNS], range_name=f"A1:{_col_letter(len(TEMPLATE_COLUMNS))}1")
+            return ws, {c: i for i, c in enumerate(TEMPLATE_COLUMNS)}, len(TEMPLATE_COLUMNS), []
+        hdr = [re.sub(r"[\s_]+", "_", str(h).strip().lower()) for h in vals[0]]
+        idx = {}
+        for c in TEMPLATE_COLUMNS:
+            if c not in hdr:
+                raise TemplateStoreError("format", f"The '{TEMPLATE_WS_TITLE}' sheet has unexpected columns. "
+                                         f"Expected: {', '.join(TEMPLATE_COLUMNS)}. Please contact support: {SUPPORT_EMAIL}.")
+            idx[c] = hdr.index(c)
+        rows = [(i + 2, r) for i, r in enumerate(vals[1:])]
+        return ws, idx, len(hdr), rows
+
+    @staticmethod
+    def _cell(r, idx, c):
+        j = idx[c]
+        return str(r[j]) if j < len(r) else ""
+
+    def _mine(self, email, idx, rows):
+        em = str(email).strip().lower()
+        return [(n, r) for n, r in rows if self._cell(r, idx, "email").strip().lower() == em]
+
+    # --- API ---
+    def list(self, email):
+        em = str(email).strip().lower()
+        c = st.session_state.get("_tpl_cache")
+        if c and c.get("email") == em and time.time() - c.get("ts", 0) < TEMPLATE_CACHE_TTL:
+            return dict(c["data"])
+        try:
+            ws, idx, width, rows = self._read()
+        except Exception as e:
+            raise _classify_store_error(e)
+        out = {}
+        for n, r in self._mine(em, idx, rows):
+            try:
+                t = validate_template(json.loads(self._cell(r, idx, "json")))
+            except Exception:
+                continue                                   # skip damaged rows instead of crashing
+            t["name"] = self._cell(r, idx, "template_name").strip() or t["name"]
+            t["created"] = self._cell(r, idx, "created_at") or t.get("created", "")
+            t["updated"] = self._cell(r, idx, "updated_at")
+            out[t["name"]] = t
+        st.session_state["_tpl_cache"] = {"email": em, "ts": time.time(), "data": out}
+        return dict(out)
+
+    def _invalidate(self):
+        st.session_state.pop("_tpl_cache", None)
+
+    def save(self, email, tpl):
+        em = str(email).strip().lower()
+        payload = json.dumps(tpl, ensure_ascii=False, separators=(",", ":"))
+        if len(payload) > TEMPLATE_CELL_LIMIT:
+            raise TemplateStoreError("size", "This template is too large to store (usually a very long filter-value list). "
+                                     "Please reduce the filter values, or use ⬇️ Download (.json) to keep it.")
+        try:
+            ws, idx, width, rows = self._read()
+            now = now_ist_str()
+            hit = [(n, r) for n, r in self._mine(em, idx, rows) if self._cell(r, idx, "template_name").strip() == tpl["name"]]
+            created = self._cell(hit[0][1], idx, "created_at") if hit else now
+            row = [""] * width
+            for c, v in (("email", em), ("template_name", tpl["name"]), ("created_at", created or now),
+                         ("updated_at", now), ("json", payload)):
+                row[idx[c]] = v
+            if hit:
+                n = hit[0][0]
+                cur = ws.row_values(n)                     # verify the row is still ours (rows can shift)
+                if self._cell(cur, idx, "email").strip().lower() != em or self._cell(cur, idx, "template_name").strip() != tpl["name"]:
+                    raise TemplateStoreError("other", "The templates sheet changed while saving. Please try again.")
+                ws.update(values=[row], range_name=f"A{n}:{_col_letter(width)}{n}")
+            else:
+                ws.append_row(row, value_input_option="RAW")
+        except Exception as e:
+            raise _classify_store_error(e)
+        finally:
+            self._invalidate()
+
+    def delete(self, email, name):
+        em = str(email).strip().lower()
+        try:
+            ws, idx, width, rows = self._read()
+            hit = [n for n, r in self._mine(em, idx, rows) if self._cell(r, idx, "template_name").strip() == name]
+            for n in sorted(hit, reverse=True):
+                cur = ws.row_values(n)
+                if self._cell(cur, idx, "email").strip().lower() == em and self._cell(cur, idx, "template_name").strip() == name:
+                    ws.delete_rows(n)
+        except Exception as e:
+            raise _classify_store_error(e)
+        finally:
+            self._invalidate()
+
+
+def get_template_store():
+    """Returns (store, note). note explains why templates are session-only (or None)."""
+    email = st.session_state.get("auth_email", "")
+    if email in DEMO_EMAILS:
+        return SessionTemplateStore(), ("🧪 Shared demo login: templates are kept only for this browser session "
+                                        "(not saved for other demo users). Use ⬇️ Download (.json) to keep one.")
+    down = st.session_state.get("_tpl_sheet_down")
+    if down and time.time() < down["until"]:
+        return SessionTemplateStore(), down["msg"]
+    ss = globals().get("TEMPLATE_SPREADSHEET")
+    if ss is None:
+        return SessionTemplateStore(), "Template storage is not configured. You can download/upload templates as .json files."
+    return SheetTemplateStore(ss), None
+
+
+def _store_failed(err: TemplateStoreError):
+    """Remember a storage outage for this session (avoid hammering the sheet) and switch to session mode."""
+    if err.kind in ("permission", "quota", "network", "other", "format"):
+        st.session_state["_tpl_sheet_down"] = {"until": time.time() + TEMPLATE_RETRY_AFTER, "msg": err.user_msg}
+        st.session_state.pop("_tpl_ws_obj", None)
+
+
+def list_templates_safe(email):
+    """(store, templates, note) – never raises."""
+    store, note = get_template_store()
+    try:
+        return store, store.list(email), note
+    except TemplateStoreError as e:
+        _store_failed(e)
+        store, note = get_template_store()
+        return store, store.list(email), note
+    except Exception as e:                                   # last-resort guard: never crash the app
+        _store_failed(_classify_store_error(e))
+        store, note = get_template_store()
+        return store, store.list(email), note
+
+
+_MONTH_RE = (r"(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|july?|aug(ust)?|"
+             r"sep(t(ember)?)?|oct(ober)?|nov(ember)?|dec(ember)?)")
+
+
+def name_to_pattern(fname: str) -> str:
+    """'Bank_Collection_Sept.csv' -> 'Bank_Collection_*.csv'; "Paytm CPB Oct'25 to Dec'25.xls" -> 'Paytm CPB * to *.xls'.
+    Month names and numbers (years, dates) become '*', so next month's file with the same naming matches."""
+    stem, ext = os.path.splitext(str(fname))
+    p = re.sub(rf"(?i)(?<![a-z]){_MONTH_RE}(?![a-z])", "*", stem)
+    p = re.sub(r"\d+", "*", p)
+    p = re.sub(r"\*(?:[^A-Za-z0-9\s]*\*)+", "*", p)
+    return p + ext.lower()
+
+
+def pattern_matches(pattern: str, fname: str) -> bool:
+    return fnmatch.fnmatchcase(str(fname).lower(), str(pattern).lower())
+
+
+def _clean_str(x, n=200):
+    return str(x).replace("\x00", "")[:n]
+
+
+def validate_template(obj) -> dict:
+    """Checks an uploaded/stored template and returns a cleaned copy (only known fields, sane types).
+    Raises ValueError with a user-friendly message."""
+    if not isinstance(obj, dict) or obj.get("schema") != TEMPLATE_SCHEMA:
+        raise ValueError("This is not a RecoSuite template file.")
+    name = _clean_str(obj.get("name", "")).strip()[:80]
+    if not name:
+        raise ValueError("Template has no name.")
+    s = obj.get("settings") or {}
+    if not isinstance(s, dict):
+        raise ValueError("Template settings are missing.")
+    lst = lambda v: [_clean_str(x) for x in v][:500] if isinstance(v, list) else []
+    filt = s.get("filter") if isinstance(s.get("filter"), dict) else {}
+    files = {}
+    for side in ("f1", "f2"):
+        rules = []
+        for r in (s.get("files", {}) or {}).get(side, [])[:50] if isinstance(s.get("files"), dict) else []:
+            if not isinstance(r, dict) or not r.get("pattern"):
+                continue
+            hdrs = {}
+            for k, v in (r.get("headers") or {}).items():
+                try:
+                    hv = int(v)
+                    if 1 <= hv <= 100000:
+                        hdrs[_clean_str(k)] = hv
+                except (TypeError, ValueError):
+                    pass
+            rules.append({"pattern": _clean_str(r["pattern"]), "example": _clean_str(r.get("example", "")),
+                          "sheets": lst(r.get("sheets")), "headers": hdrs})
+        files[side] = rules
+    mapping = s.get("col_mapping") if isinstance(s.get("col_mapping"), dict) else {}
+    try:
+        tol = float(s.get("tolerance", 5.0))
+    except (TypeError, ValueError):
+        tol = 5.0
+    try:
+        rows_b = int(s.get("rows_in_browser", 2000))
+    except (TypeError, ValueError):
+        rows_b = 2000
+    return {
+        "schema": TEMPLATE_SCHEMA, "name": name,
+        "created": _clean_str(obj.get("created", ""), 40), "app_version": _clean_str(obj.get("app_version", ""), 20),
+        "settings": {
+            "key_cols": lst(s.get("key_cols")),
+            "compare_mode": s.get("compare_mode") if s.get("compare_mode") in ("Compare selected columns", "Compare common columns") else "Compare selected columns",
+            "compare_cols": lst(s.get("compare_cols")),
+            "focus_col": _clean_str(s.get("focus_col", "")),
+            "tolerance": max(0.0, tol),
+            "blanks_equal": bool(s.get("blanks_equal", True)),
+            "skip_mismatch_columns": bool(s.get("skip_mismatch_columns", True)),
+            "rows_in_browser": max(100, rows_b),
+            "filter": {"enabled": bool(filt.get("enabled", False)), "column": _clean_str(filt.get("column", "")),
+                       "values": lst(filt.get("values"))},
+            "col_mapping": {_clean_str(k): _clean_str(v) for k, v in list(mapping.items())[:500]},
+            "files": files,
+        },
+    }
+
+
+def _kw_if_new(key: str, **kw) -> dict:
+    """Pass default/value/index to a keyed widget only when its state isn't set yet
+    (avoids Streamlit's 'default value + Session State' warning when a template set it)."""
+    return {} if key in st.session_state else kw
+
+
+def _sanitize_state_list(key: str, options):
+    if key in st.session_state:
+        opts = set(options)
+        cur = st.session_state[key] or []
+        st.session_state[key] = [c for c in cur if c in opts]
+
+
+def _sanitize_state_one(key: str, options):
+    if key in st.session_state and st.session_state[key] not in list(options):
+        del st.session_state[key]
+
+
+def apply_template_cb(tpl_name: str):
+    """on_click callback: runs BEFORE the script, so it may set the state of every widget
+    (including header-row / sheet widgets that are drawn above the template box)."""
+    email = st.session_state.get("auth_email", "")
+    ctx = st.session_state.get("_tpl_ctx") or {}
+    _store, tpls, _note = list_templates_safe(email) if email else (None, {}, None)
+    tpl = tpls.get(tpl_name)
+    if not email or not tpl:
+        st.session_state["_tpl_note"] = {"error": "Template not found. Please reload the page and try again."}
+        return
+    try:
+        tpl = validate_template(tpl)
+    except ValueError as ex:
+        st.session_state["_tpl_note"] = {"error": str(ex)}
+        return
+    s = tpl["settings"]
+    cols1, cols2 = list(ctx.get("cols1", [])), list(ctx.get("cols2", []))
+    internal = {"_SOURCE_FILE", "_KEY", "_merge", "_SHEET"}
+    applied, missing, file_lines = [], [], []
+
+    mp = {a: b for a, b in s["col_mapping"].items() if a in cols1 and b in cols2}
+    for a, b in s["col_mapping"].items():
+        if a not in mp:
+            missing.append(f"mapping {a} → {b}")
+    common = ((set(cols1) & set(cols2)) | set(mp.keys())) - internal
+    if mp:
+        st.session_state["mapping_enabled"] = True
+        st.session_state["_tpl_mapping_pending"] = mp
+        applied.append(f"Column mapping: {len(mp)} pair(s)")
+
+    keys = [c for c in s["key_cols"] if c in common]
+    missing += [c for c in s["key_cols"] if c not in common]
+    if keys:
+        st.session_state[_TPL_W + "key_cols"] = keys
+        applied.append("Key (COALESCE): " + " / ".join(keys))
+
+    st.session_state[_TPL_W + "compare_mode"] = s["compare_mode"]
+    applied.append(f"Compare mode: {s['compare_mode']}")
+    if s["compare_mode"] == "Compare selected columns":
+        cc = [c for c in s["compare_cols"] if c in common]
+        missing += [c for c in s["compare_cols"] if c not in common and c not in missing]
+        st.session_state[_TPL_W + "compare_cols"] = cc
+        applied.append(f"Compare columns ({len(cc)}): " + ", ".join(cc))
+        if s["focus_col"] in cc:
+            st.session_state[_TPL_W + "focus"] = s["focus_col"]
+            applied.append(f"Summary 'Particular': {s['focus_col']}")
+    elif s["focus_col"] in common:
+        st.session_state[_TPL_W + "focus_common"] = s["focus_col"]
+        applied.append(f"Summary 'Particular': {s['focus_col']}")
+    if s["focus_col"] and s["focus_col"] not in common and s["focus_col"] not in missing:
+        missing.append(s["focus_col"])
+
+    st.session_state[_TPL_W + "tol"] = float(s["tolerance"])
+    st.session_state[_TPL_W + "blanks"] = bool(s["blanks_equal"])
+    st.session_state[_TPL_W + "skip"] = bool(s["skip_mismatch_columns"])
+    st.session_state[_TPL_W + "rows"] = int(s["rows_in_browser"])
+    applied.append(f"Tolerance ±{s['tolerance']:g} · blanks equal: {'yes' if s['blanks_equal'] else 'no'}")
+
+    f = s["filter"]
+    if f["enabled"] and f["column"] in common:
+        st.session_state[_TPL_W + "filter_on"] = True
+        st.session_state[_TPL_W + "filter_col"] = f["column"]
+        st.session_state[_TPL_W + "filter_text"] = "\n".join(f["values"])
+        applied.append(f"Filter: {f['column']} = {', '.join(f['values'][:5])}{' …' if len(f['values']) > 5 else ''}")
+    else:
+        st.session_state[_TPL_W + "filter_on"] = False
+        if f["enabled"]:
+            missing.append(f"filter column {f['column']}")
+
+    for side, label in (("f1", "File 1"), ("f2", "File 2")):
+        for fe in ctx.get("files", {}).get(side, []):
+            rule = next((r for r in s["files"].get(side, []) if pattern_matches(r["pattern"], fe["name"])), None)
+            if not rule:
+                continue
+            bits = []
+            sheets = [sh for sh in rule["sheets"] if sh in fe["sheets"]]
+            if fe["picker"] and sheets:
+                st.session_state[f"sheets|{fe['base_key']}"] = sheets
+                bits.append("sheets " + ", ".join(sheets))
+            elif fe["picker"] and rule["sheets"]:
+                missing.append(f"sheet(s) {', '.join(rule['sheets'])} in {fe['name']}")
+            for sh in (sheets or fe["sheets_used"]):
+                if sh in rule["headers"]:
+                    st.session_state[f"hdr|{fe['base_key']}|{sh}"] = int(rule["headers"][sh])
+                    bits.append(f"header row {rule['headers'][sh]}" + ("" if sh == "CSV" else f" ({sh})"))
+            if bits:
+                file_lines.append(f"{label}: `{fe['name']}` ← `{rule['pattern']}`: " + ", ".join(bits))
+
+    st.session_state["_tpl_keep_widgets"] = True
+    st.session_state["_tpl_note"] = {"name": tpl["name"], "applied": applied, "files": file_lines, "missing": missing}
+    st.session_state["run_done"] = False
+
+
+def build_template(name: str, settings_now: dict, f1_settings: dict, f2_settings: dict) -> dict:
+    def rules(side_settings):
+        out, seen = [], set()
+        for k, v in (side_settings or {}).items():
+            fname = k.rsplit("|", 1)[0]
+            pat = name_to_pattern(fname)
+            if pat in seen:
+                continue
+            seen.add(pat)
+            out.append({"pattern": pat, "example": fname, "sheets": list(v.get("sheets", [])),
+                        "headers": {sh: int(h) + 1 for sh, h in (v.get("headers") or {}).items()}})
+        return out
+    s = dict(settings_now)
+    s["files"] = {"f1": rules(f1_settings), "f2": rules(f2_settings)}
+    return validate_template({"schema": TEMPLATE_SCHEMA, "name": name, "created": now_ist_str(),
+                              "app_version": APP_VERSION, "settings": s})
+
+
+def template_limit() -> int:
+    return TEMPLATE_LIMITS["free"] if int(st.session_state.get("row_limit", 100)) <= 100 else TEMPLATE_LIMITS["paid"]
+
+
+def _template_matches_files(tpl: dict, ctx: dict) -> bool:
+    try:
+        rules = tpl["settings"]["files"]
+        names = {side: [fe["name"] for fe in ctx.get("files", {}).get(side, [])] for side in ("f1", "f2")}
+        return all(any(pattern_matches(r["pattern"], n) for r in rules.get(side, []) for n in names[side])
+                   for side in ("f1", "f2") if rules.get(side))
+    except Exception:
+        return False
+
+
+def _tpl_json_bytes(t: dict) -> bytes:
+    return json.dumps(t, ensure_ascii=False, indent=1).encode("utf-8")
+
+
+def _tpl_file_name(name: str) -> str:
+    return (re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "template") + ".recosuite.json"
+
+
+def _save_to_store(store, email, t, existing: dict, limit: int) -> bool:
+    """Saves with limit check; on storage failure falls back to session store. Returns True if saved."""
+    if t["name"] not in existing and len(existing) >= limit:
+        st.session_state["_tpl_flash"] = ("warning", f"Your plan allows {limit} saved template(s). Delete one or upgrade to save more.")
+        return False
+    try:
+        store.save(email, t)
+        return True
+    except TemplateStoreError as e:
+        if e.kind == "size":
+            st.session_state["_tpl_flash"] = ("warning", e.user_msg)
+            return False
+        _store_failed(e)
+        SessionTemplateStore().save(email, t)
+        st.session_state["_tpl_flash"] = ("warning", e.user_msg + " The template was kept for this session only.")
+        return True
+
+
+def templates_panel():
+    """'📋 Saved templates' box shown right after upload: load / download / import / delete."""
+    email = st.session_state.get("auth_email", "")
+    if not email:
+        return
+    store, tpls, store_note = list_templates_safe(email)
+    ctx = st.session_state.get("_tpl_ctx") or {}
+    limit = template_limit()
+    with st.container(border=True, key="tpl_panel"):
+        st.markdown("#### 📋 Saved templates")
+        if store_note:
+            (st.info if email in DEMO_EMAILS else st.warning)(store_note)
+        note = st.session_state.pop("_tpl_note", None)
+        if note and note.get("error"):
+            st.error(note["error"])
+        elif note:
+            lines = "\n".join(f"- {x}" for x in note["applied"] + note["files"])
+            st.success(f"✅ Template **{note['name']}** applied. Settings below are filled in; check them and click **✅ Run Reco**.\n\n{lines}")
+            if note["missing"]:
+                st.warning("⚠️ Not found in these files, so skipped: " + ", ".join(dict.fromkeys(note["missing"]))
+                           + ". Please pick replacements below if needed.")
+        flash = st.session_state.pop("_tpl_flash", None)
+        if flash:
+            (st.warning if flash[0] == "warning" else st.success)(flash[1])
+        if not tpls:
+            st.caption("No templates yet. Set up your reco below once, then click **💾 Save as template**. "
+                       "Next month just upload the new files and load it here.")
+        else:
+            names = sorted(tpls)
+            matching = [n for n in names if _template_matches_files(tpls[n], ctx)]
+            default_idx = names.index(matching[0]) if matching else 0
+            if "_tpl_pick_next" in st.session_state:
+                st.session_state["tpl_pick"] = st.session_state.pop("_tpl_pick_next")
+            _sanitize_state_one("tpl_pick", names)
+            cA, cB = st.columns([3, 1])
+            with cA:
+                pick = st.selectbox("Load template", names, key="tpl_pick", **_kw_if_new("tpl_pick", index=default_idx),
+                                    format_func=lambda n: f"{n}  ✨ matches your files" if n in matching else n)
+            with cB:
+                st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+                st.button("📥 Apply template", type="primary", on_click=apply_template_cb, args=(pick,), key="tpl_apply")
+            t = tpls.get(pick, {})
+            ts = t.get("settings", {})
+            when = t.get("updated") or t.get("created") or ""
+            st.caption(f"Saved {when} IST · key: {' / '.join(ts.get('key_cols', []))} · "
+                       f"{len(ts.get('compare_cols', []))} compare column(s) · Particular: {ts.get('focus_col', '')}")
+            d1, d2, _ = st.columns([1, 1, 2])
+            with d1:
+                st.download_button("⬇️ Download template (.json)", data=_tpl_json_bytes(t), file_name=_tpl_file_name(pick),
+                                   mime="application/json", key="tpl_dl")
+            with d2:
+                if st.button("🗑️ Delete", key="tpl_del"):
+                    try:
+                        store.delete(email, pick)
+                        st.session_state["_tpl_flash"] = ("success", f"🗑️ Template '{pick}' deleted.")
+                    except TemplateStoreError as e:
+                        _store_failed(e)
+                        st.session_state["_tpl_flash"] = ("warning", e.user_msg)
+                    st.rerun()
+        with st.expander("⬆️ Upload a template (.json) from your computer / team"):
+            up = st.file_uploader("Template file", type=["json"], key="tpl_upload", label_visibility="collapsed")
+            if up:
+                try:
+                    raw = up.getvalue()
+                    if len(raw) > TEMPLATE_MAX_BYTES:
+                        raise ValueError("File is too large for a template.")
+                    t = validate_template(json.loads(raw.decode("utf-8-sig")))
+                    st.caption(f"Found template **{t['name']}** (key: {' / '.join(t['settings']['key_cols'])}).")
+                    label = "Save to my templates" if store.persistent else "Use for this session"
+                    if st.button(label, key="tpl_import"):
+                        if _save_to_store(store, email, t, tpls, limit):
+                            st.session_state["_tpl_flash"] = st.session_state.get("_tpl_flash") or ("success", f"✅ Template '{t['name']}' added.")
+                            st.session_state["_tpl_pick_next"] = t["name"]
+                        st.rerun()
+                except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as ex:
+                    st.error(f"Could not read template: {ex}")
+        if limit <= TEMPLATE_LIMITS["free"]:
+            st.caption(f"🆓 Free/demo plan: you can save **{limit}** template to try it. "
+                       f"Paid plans save up to {TEMPLATE_LIMITS['paid']} templates for all your monthly recos.")
+
+
+def save_template_ui(settings_now: dict, f1_settings: dict, f2_settings: dict):
+    """'💾 Save as template' button + dialog (name, what will be saved, save / download)."""
+    email = st.session_state.get("auth_email", "")
+    if not email:
+        return
+    limit = template_limit()
+    pats = [name_to_pattern(k.rsplit("|", 1)[0]) for k in list(f1_settings)[:1] + list(f2_settings)[:1]]
+    suggestion = " vs ".join(os.path.splitext(p)[0].replace("*", "").strip(" _-'") for p in pats) or "My reco"
+
+    def _body():
+        store, tpls, store_note = list_templates_safe(email)
+        name = st.text_input("Template name", value=suggestion + " – Monthly", max_chars=80, key="tpl_name")
+        s = settings_now
+        st.markdown(
+            f"- **Key:** {' / '.join(s['key_cols'])}\n"
+            f"- **Compare:** {s['compare_mode']}"
+            + (f" → {', '.join(s['compare_cols'])}" if s['compare_mode'] == 'Compare selected columns' else "") + "\n"
+            f"- **Particular:** {s['focus_col']} · **Tolerance:** ±{s['tolerance']:g} · **Blanks equal:** {'yes' if s['blanks_equal'] else 'no'}\n"
+            f"- **Filter:** {(s['filter']['column'] + ' = ' + ', '.join(s['filter']['values'][:5])) if s['filter']['enabled'] else 'off'}\n"
+            f"- **Files:** " + "; ".join(f"`{name_to_pattern(k.rsplit('|', 1)[0])}`" for k in list(f1_settings) + list(f2_settings))
+        )
+        st.caption("File names are saved as patterns (month/year → *), so next month's files match automatically. "
+                   "No file data is saved, only settings.")
+        if store_note:
+            st.caption("ℹ️ " + store_note)
+        nm = name.strip()
+        t = build_template(nm or "template", settings_now, f1_settings, f2_settings)
+        exists = nm in tpls
+        if exists:
+            st.info("A template with this name exists. Saving will update it.")
+        blocked = (not exists) and len(tpls) >= limit
+        if blocked:
+            st.warning(f"Your plan allows {limit} saved template(s). Delete one in 📋 Saved templates, or upgrade to save more. "
+                       f"You can still download this one as .json.")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("💾 Save template" if store.persistent else "💾 Save for this session", type="primary",
+                         key="tpl_save_btn", disabled=(not nm) or blocked):
+                if _save_to_store(store, email, t, tpls, limit):
+                    st.session_state["_tpl_saved"] = (t["name"], store.persistent and not st.session_state.get("_tpl_flash"))
+                st.rerun()
+        with b2:
+            st.download_button("⬇️ Download (.json)", data=_tpl_json_bytes(t), file_name=_tpl_file_name(nm or "template"),
+                               mime="application/json", key="tpl_dl_dialog", disabled=not nm)
+
+    if hasattr(st, "dialog"):
+        dlg = st.dialog("💾 Save as template")(_body)
+        if st.button("💾 Save as template", key="tpl_open"):
+            dlg()
+    else:
+        with st.expander("💾 Save as template"):
+            _body()
+    saved = st.session_state.pop("_tpl_saved", None)
+    if saved:
+        name, persistent = saved
+        where = "" if persistent else " (for this browser session; download the .json to keep it)"
+        st.success(f"✅ Template **{name}** saved{where}. Next month: upload the new files, choose it in "
+                   f"📋 Saved templates (top of the page) and click Apply.")
+        flash = st.session_state.pop("_tpl_flash", None)
+        if flash:
+            st.warning(flash[1])
+        if hasattr(st, "toast"):
+            st.toast(f"Template '{name}' saved", icon="💾")
 
 
 def settings_signature(settings: dict) -> tuple:
@@ -1600,6 +2248,11 @@ if st.session_state.get("files_sig") != sig:
         if k in st.session_state:
             del st.session_state[k]
 
+    # 📋 new files -> reco settings go back to defaults (as before), unless a template was just applied
+    if not st.session_state.get("_tpl_keep_widgets"):
+        for k in [k for k in list(st.session_state.keys()) if str(k).startswith(_TPL_W)]:
+            del st.session_state[k]
+
     # ✅ FIX 1: Reset dup mode radio and comparison cache when new files uploaded
     # This fixes the issue where Back to Launcher + relaunch keeps stale dup state
     for k in [
@@ -1679,6 +2332,15 @@ elif len(df1) > _row_limit or len(df2) > _row_limit:
 common_cols = sorted(list(set(df1.columns).intersection(set(df2.columns))))
 internal_cols = {"_SOURCE_FILE", "_KEY", "_merge", "_SHEET"}
 matched_cols = [c for c in common_cols if c not in internal_cols]
+
+# 📋 Saved templates box (right after upload)
+st.session_state.pop("_tpl_keep_widgets", None)
+st.session_state["_tpl_ctx"] = {
+    "cols1": [c for c in df1.columns if c not in internal_cols],
+    "cols2": [c for c in df2.columns if c not in internal_cols],
+    "files": {"f1": st.session_state.get("_tpl_files_f1", []), "f2": st.session_state.get("_tpl_files_f2", [])},
+}
+templates_panel()
 
 def missing_matched_cols_by_file(combined_df: pd.DataFrame, matched_cols: list) -> pd.DataFrame:
     if combined_df is None or combined_df.empty or "_SOURCE_FILE" not in combined_df.columns:
@@ -1779,6 +2441,11 @@ else:
         _auto = _auto_suggest(_unmatched_f1, _unmatched_f2)
 
         # Reset mapping if files changed
+        if "_tpl_mapping_pending" in st.session_state:          # 📋 mapping from a template
+            st.session_state["col_mapping"] = dict(st.session_state.pop("_tpl_mapping_pending"))
+            st.session_state["col_mapping_sig"] = str(sig)
+            for _k in [k for k in list(st.session_state.keys()) if str(k).startswith("colmap_")]:
+                del st.session_state[_k]
         if st.session_state.get("col_mapping_sig") != str(sig):
             st.session_state["col_mapping_sig"] = str(sig)
             st.session_state["col_mapping"] = _auto.copy()
@@ -1943,10 +2610,15 @@ for c in auto_suggest:
         _seen_default.add(c)
         _safe_default.append(c)
 
+_kc_before = list(st.session_state.get(_TPL_W + "key_cols") or [])
+_sanitize_state_list(_TPL_W + "key_cols", common_cols)
+if _kc_before and st.session_state.get(_TPL_W + "key_cols") == []:   # all saved keys vanished (new files) -> defaults
+    del st.session_state[_TPL_W + "key_cols"]
 key_cols_sel = wrap_multiselect(
     "Select key column(s) — COALESCE priority follows order below",
     options=_dedup(common_cols),
-    default=_safe_default
+    key=_TPL_W + "key_cols",
+    **_kw_if_new(_TPL_W + "key_cols", default=_safe_default)
 )
 
 priority_text = st.text_input(
@@ -2149,21 +2821,26 @@ st.subheader("2) Select Reco Settings")
 c1, c2, c3 = st.columns([2, 2, 2])
 
 with c2:
-    compare_mode = st.selectbox("Compare mode", ["Compare selected columns", "Compare common columns"])
+    compare_mode = st.selectbox("Compare mode", ["Compare selected columns", "Compare common columns"], key=_TPL_W + "compare_mode")
     default_sel = default_compare_selection(common_cols)
 
     if compare_mode == "Compare selected columns":
+        _sanitize_state_list(_TPL_W + "compare_cols", common_cols)
         compare_cols = wrap_multiselect(
             "Select columns to compare (must exist in both)",
             common_cols,
-            default=default_sel if default_sel else (common_cols[:7] if len(common_cols) >= 7 else common_cols)
+            key=_TPL_W + "compare_cols",
+            **_kw_if_new(_TPL_W + "compare_cols",
+                         default=default_sel if default_sel else (common_cols[:7] if len(common_cols) >= 7 else common_cols))
         )
         compare_cols = reorder_selected_cols(compare_cols)
         st.caption(f"{len(compare_cols)} column{'' if len(compare_cols) == 1 else 's'} selected")   # ✅ v1.7.2
+        _sanitize_state_one(_TPL_W + "focus", compare_cols if compare_cols else common_cols)
         reco_focus_col = st.selectbox(
             "Summary 'Particular' column (choose ONE from selected columns)",
             options=compare_cols if compare_cols else common_cols,
-            index=0 if compare_cols else 0
+            key=_TPL_W + "focus",
+            **_kw_if_new(_TPL_W + "focus", index=0)
         )
         # ✅ Move selected Particular column to FRONT of compare list (first in output columns)
         if reco_focus_col and reco_focus_col in compare_cols:
@@ -2171,24 +2848,28 @@ with c2:
             compare_cols = [reco_focus_col] + rest
     else:
         compare_cols = common_cols
+        _sanitize_state_one(_TPL_W + "focus_common", common_cols)
         reco_focus_col = st.selectbox(
             "Summary 'Particular' column (choose ONE from common columns)",
             options=common_cols,
-            index=0
+            key=_TPL_W + "focus_common",
+            **_kw_if_new(_TPL_W + "focus_common", index=0)
         )
 
 with c3:
     numeric_tolerance = st.number_input(
         "Numeric tolerance (+/-) default 5",
         min_value=0.0,
-        value=5.0,
-        step=1.0
+        step=1.0,
+        key=_TPL_W + "tol",
+        **_kw_if_new(_TPL_W + "tol", value=5.0)
     )
-    treat_blanks_as_equal = st.checkbox("Treat blanks/NaN as equal", value=True)
+    treat_blanks_as_equal = st.checkbox("Treat blanks/NaN as equal", key=_TPL_W + "blanks", **_kw_if_new(_TPL_W + "blanks", value=True))
 
     st.markdown("**Performance options**")
-    skip_mismatch_columns = st.checkbox("✅ Skip Mismatch_Columns (fastest mode)", value=True)
-    show_rows_in_browser = st.number_input("Rows to show in browser (per tab)", min_value=100, value=2000, step=500)
+    skip_mismatch_columns = st.checkbox("✅ Skip Mismatch_Columns (fastest mode)", key=_TPL_W + "skip", **_kw_if_new(_TPL_W + "skip", value=True))
+    show_rows_in_browser = st.number_input("Rows to show in browser (per tab)", min_value=100, step=500,
+                                           key=_TPL_W + "rows", **_kw_if_new(_TPL_W + "rows", value=2000))
 
 with c1:
     st.write("✅ Key is COALESCE (no detection).")
@@ -2207,7 +2888,8 @@ if compare_mode == "Compare selected columns" and not compare_cols:
 st.markdown("### 🧹 Optional Filter (run reco on subset)")
 st.caption("Example: if you have a Lender ID column in both files, filter to run reco only for one lender.")
 
-filter_enabled = st.checkbox("Enable filter (applied on BOTH sides before reco)", value=False)
+filter_enabled = st.checkbox("Enable filter (applied on BOTH sides before reco)", key=_TPL_W + "filter_on",
+                             **_kw_if_new(_TPL_W + "filter_on", value=False))
 
 # Smart default: try to find a lender-like column
 _filter_candidates = [
@@ -2225,7 +2907,9 @@ if _filter_default is None and common_cols:
     _filter_default = common_cols[0]
 
 _filter_col_idx = common_cols.index(_filter_default) if _filter_default in common_cols else 0
-filter_col = st.selectbox("Filter column", options=common_cols, index=_filter_col_idx)
+_sanitize_state_one(_TPL_W + "filter_col", common_cols)
+filter_col = st.selectbox("Filter column", options=common_cols, key=_TPL_W + "filter_col",
+                          **_kw_if_new(_TPL_W + "filter_col", index=_filter_col_idx))
 
 # Show unique value picker + manual text entry
 picked_values = []
@@ -2273,7 +2957,8 @@ if filter_enabled:
 
 filter_value_raw = st.text_area(
     "Filter value(s) — one per line or comma-separated (case-insensitive, exact match after trim)",
-    value="",
+    key=_TPL_W + "filter_text",
+    **_kw_if_new(_TPL_W + "filter_text", value=""),
     height=90,
     placeholder="Example:\n85\n86\n87   (or  85, 86, 87)"
 )
@@ -2293,6 +2978,20 @@ if filter_enabled and not filter_values:
     st.warning("⚠️ Filter is enabled but no value entered. Please add at least one value or disable the filter.")
 elif filter_enabled and filter_values:
     st.caption(f"✅ Filter will apply on **{len(filter_values)}** value(s) → column: **{filter_col}**")
+
+# 📋 Save the current setup as a template
+save_template_ui({
+    "key_cols": list(existing_key_candidates),
+    "compare_mode": compare_mode,
+    "compare_cols": list(compare_cols) if compare_mode == "Compare selected columns" else [],
+    "focus_col": reco_focus_col or "",
+    "tolerance": float(numeric_tolerance),
+    "blanks_equal": bool(treat_blanks_as_equal),
+    "skip_mismatch_columns": bool(skip_mismatch_columns),
+    "rows_in_browser": int(show_rows_in_browser),
+    "filter": {"enabled": bool(filter_enabled), "column": filter_col or "", "values": list(filter_values)},
+    "col_mapping": dict(st.session_state.get("col_mapping", {})) if st.session_state.get("mapping_enabled") else {},
+}, f1_settings, f2_settings)
 
 # -----------------------------
 # ✅ 2.5) Selected Field Summary (before Run) — FIXED TO MATCH RUN LOGIC + COALESCE KEY
