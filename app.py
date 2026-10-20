@@ -82,6 +82,8 @@ st.session_state["row_limit"] = ROW_LIMIT
 import io
 import time
 import re
+import csv        # ✅ NEW v1.7: CSV preview for header detection
+import hashlib    # ✅ NEW v1.7: content hash for the per-file parse cache
 import pandas as pd
 import streamlit as st
 
@@ -142,8 +144,8 @@ st.markdown(f"""
 # 🔹 App Meta + Layout (PASTE ONCE, NEVER TOUCH AGAIN)
 # ============================================================
 
-APP_VERSION  = "v1.6"
-LAST_UPDATED = "2026-03-23"
+APP_VERSION  = "v1.7"
+LAST_UPDATED = "2026-10-20"
 COMPANY_NAME = "RecoSuite"
 
 # ---------- Title ----------
@@ -199,7 +201,8 @@ st.markdown(
 )
 
 # ============================================================
-st.caption("Upload multiple files on both sides (CSV/XLSX/XLSB). Each side is combined, then reco runs once.")
+st.caption("Upload multiple files on both sides (CSV/XLSX/XLS/XLSB). Each side is combined, then reco runs once. "
+           "The header row is found automatically (title lines above it are ignored); change it or pick sheets in ⚙️ settings.")
 
 # -----------------------------
 # Helpers
@@ -282,104 +285,374 @@ def _fix_mixed_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _combine_sheets(sheets: dict, file_name: str) -> pd.DataFrame:
+# ============================================================
+# ✅ NEW (v1.7): automatic HEADER-ROW detection + SHEET picker + per-file cache
+#    - Every CSV and every Excel sheet: the first rows are scanned and the most header-like row
+#      is used as the header (title / bank name / date lines above it are dropped).
+#    - The user can override the header row (1-based) and pick sheets in "⚙️ File settings".
+#    - Parsing is cached on the file's CONTENT HASH (+ sheet + header row): content-derived,
+#      so nothing can leak between users (you need the same bytes to get the same entry).
+# ============================================================
+HEADER_SCAN_ROWS = 25          # header must be within the first 25 rows (rows below are look-ahead only)
+_HEADER_LOOKAHEAD = 10
+
+_NUMLIKE_RE = re.compile(r"^[\s\-+()₹$€£,.%0-9]*\d[\s\-+()₹$€£,.%0-9]*$")
+_DATELIKE_RE = re.compile(r"^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}([ T]\d{1,2}:\d{2}(:\d{2})?)?$")
+
+
+def _cell_str(v) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).replace("\u00A0", " ").replace("\u200B", "").strip()
+
+
+def _is_label(s: str) -> bool:
+    """Looks like a column title: has letters, is not a number/date/code like 'LAN000123'."""
+    if not s or len(s) > 60:
+        return False
+    if _NUMLIKE_RE.match(s) or _DATELIKE_RE.match(s):
+        return False
+    if not any(ch.isalpha() for ch in s):
+        return False
+    digits = sum(ch.isdigit() for ch in s)
+    return digits <= 0.5 * len(s.replace(" ", ""))
+
+
+def detect_header_row(rows, scan: int = HEADER_SCAN_ROWS) -> int:
     """
-    ✅ FIX: previously only the sheet with MAX rows was read and every other sheet was silently ignored.
-    Now: the largest sheet defines the headers; every non-empty sheet with the SAME headers is appended
-    (workbook order). Sheets with different headers are skipped and listed in a warning.
-    _SHEET is set per row.
+    rows: first rows of a sheet as lists of cell values (header=None).
+    Returns the 0-based index of the most header-like row among the first `scan` rows.
+    Score = width (filled cells vs widest row) × share of label-like cells × uniqueness
+            × coverage of the columns that are filled in the rows below
+            × precision (header cells sit over columns that have data)
+            × bonus when the values below are numbers/dates/codes (type change).
+    The EARLIEST row scoring within 80% of the best wins (headers come before data).
     """
-    non_empty = [(sh, d) for sh, d in sheets.items() if d is not None and not d.dropna(how="all").empty]
-    if not non_empty:
-        out = pd.DataFrame()
-        out["_SHEET"] = "UNKNOWN"
-        return out
-    base_sh, base_df = max(non_empty, key=lambda x: len(x[1]))
-    base_set = set(normalize_cols(base_df).columns)
-    parts, used, skipped = [], [], []
-    for sh, d in non_empty:
-        dn = normalize_cols(d)
-        if set(dn.columns) == base_set:
-            dn = dn.copy()
-            dn["_SHEET"] = str(sh)
-            parts.append(dn)
-            used.append(str(sh))
+    from collections import Counter
+    rows = [[_cell_str(v) for v in r] for r in (rows or [])]
+    n = len(rows)
+    filled = [[j for j, v in enumerate(r) if v] for r in rows]
+    nonempty_idx = [i for i in range(n) if filled[i]]
+    if not nonempty_idx:
+        return 0
+    first_nonempty = nonempty_idx[0]
+    max_w = max(len(f) for f in filled)
+    scores = {}
+    for i in range(min(scan, n)):
+        f = filled[i]
+        if not f or (len(f) < 2 and max_w >= 2):
+            continue
+        vals = [rows[i][j] for j in f]
+        is_lab = [_is_label(v) for v in vals]
+        label_ratio = sum(is_lab) / len(vals)
+        if label_ratio == 0:
+            continue
+        uniq_ratio = len({v.lower() for v in vals}) / len(vals)
+        below = [k for k in range(i + 1, min(n, i + 1 + _HEADER_LOOKAHEAD)) if filled[k]]
+        if below:
+            cnt = Counter(j for k in below for j in filled[k])
+            data_cols = {j for j, c in cnt.items() if c >= max(1.0, len(below) / 2.0)} or set(cnt)
+            fs = set(f)
+            coverage = len(fs & data_cols) / len(data_cols)
+            precision = len(fs & set(cnt)) / len(fs)
+            tc = 0
+            for j, lab in zip(f, is_lab):
+                if not lab:
+                    continue
+                col_vals = [rows[k][j] for k in below if j < len(rows[k]) and rows[k][j]]
+                if col_vals and sum(not _is_label(v) for v in col_vals) / len(col_vals) >= 0.5:
+                    tc += 1
+            type_change = tc / len(f)
         else:
-            skipped.append(str(sh))
-    if len(used) > 1:
-        st.warning(f"📑 {file_name}: combined {len(used)} sheets with identical headers: {', '.join(used)}. "
-                   f"If one of them is a copy/backup, remove it (copies will show up as duplicates).")
-    if skipped:
-        st.warning(f"📑 {file_name}: skipped sheet(s) with different headers: {', '.join(skipped)} "
-                   f"(only sheets with the same headers as '{base_sh}' are used).")
-    return pd.concat(parts, ignore_index=True)
+            coverage, precision, type_change = 0.3, 1.0, 0.0
+        width = len(f) / max_w
+        scores[i] = (width * label_ratio * uniq_ratio * (0.4 + 0.6 * coverage)
+                     * (0.5 + 0.5 * precision) * (1.0 + 0.5 * type_change))
+    if not scores:
+        return first_nonempty
+    best = max(scores.values())
+    for i in sorted(scores):
+        if scores[i] >= 0.8 * best:
+            return i
+    return first_nonempty
 
 
-def read_file_once(uploaded_file) -> pd.DataFrame:
+def _apply_header(raw: pd.DataFrame, h: int) -> pd.DataFrame:
+    """raw grid (header=None, dtype=str) -> table using row h as header.
+    Rows above h are dropped, fully empty rows are dropped, and columns with NO header AND no data are dropped.
+    Blank header cells become 'Unnamed: <col>' and duplicates become 'X.1', 'X.2' (same as pandas header=0)."""
+    if raw is None or raw.empty or h < 0 or h >= len(raw):
+        return pd.DataFrame()
+    hdr = [_cell_str(v) for v in raw.iloc[h].tolist()]
+    names, seen = [], {}
+    for j, v in enumerate(hdr):
+        nm = v if v else f"Unnamed: {j}"
+        if nm in seen:
+            seen[nm] += 1
+            nm = f"{nm}.{seen[nm]}"
+        else:
+            seen[nm] = 0
+        names.append(nm)
+    body = raw.iloc[h + 1:].copy()
+    body.columns = names
+    return _clean_table(body, header_blank=[not v for v in hdr])
+
+
+def _clean_table(df: pd.DataFrame, header_blank=None) -> pd.DataFrame:
+    """Drop fully empty rows and columns that have neither a header nor any data."""
+    if df is None or len(df.columns) == 0:
+        return pd.DataFrame()
+    df = df.dropna(how="all")
+    if header_blank is None:
+        header_blank = [str(c).startswith("Unnamed: ") for c in df.columns]
+    keep = [c for c, hb in zip(df.columns, header_blank) if not (hb and not df[c].notna().any())]
+    return df.loc[:, keep].reset_index(drop=True)
+
+
+def _file_ext(name: str) -> str:
+    n = str(name).lower()
+    for e in (".csv", ".xlsx", ".xlsm", ".xls", ".xlsb"):
+        if n.endswith(e):
+            return e
+    return ""
+
+
+def _csv_preview(b: bytes, limit: int = 256 * 1024):
+    """First records of a CSV (csv-module records = pandas skiprows units)."""
+    chunk = b[:limit]
+    text = chunk.decode("utf-8-sig", errors="replace")
+    recs = []
+    try:
+        for r in csv.reader(io.StringIO(text, newline="")):
+            recs.append(r)
+            if len(recs) >= HEADER_SCAN_ROWS + _HEADER_LOOKAHEAD + 1:
+                break
+    except csv.Error:
+        pass
+    if len(b) > limit and len(recs) > 1 and len(recs) < HEADER_SCAN_ROWS + _HEADER_LOOKAHEAD + 1:
+        recs = recs[:-1]   # last record may be cut by the preview limit
+    return recs
+
+
+def _read_csv_table(b: bytes, header_row: int) -> pd.DataFrame:
+    kw = {"dtype": str}                 # ✅ TEXT (keeps leading zeros / long IDs)
+    if header_row > 0:
+        kw["skiprows"] = header_row     # counts CSV records (blank lines included), same as the preview
+    try:
+        try:
+            df = pd.read_csv(io.BytesIO(b), **kw)
+        except UnicodeDecodeError:      # ✅ Excel-saved CSVs in Windows-1252 (₹, é …)
+            df = pd.read_csv(io.BytesIO(b), encoding="cp1252", **kw)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+    return _clean_table(df)
+
+
+@st.cache_data(show_spinner=False, max_entries=32, ttl=1800)
+def _cached_csv_table(digest: str, header_row: int, _b: bytes) -> pd.DataFrame:
+    return _read_csv_table(_b, header_row)
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=1800)
+def _cached_excel_raw(digest: str, ext: str, _b: bytes) -> dict:
+    """All sheets as raw grids (header=None, dtype=str). Row 0 = Excel row 1."""
+    engine = "pyxlsb" if ext == ".xlsb" else None
+    sheets = pd.read_excel(io.BytesIO(_b), sheet_name=None, header=None, dtype=str, engine=engine)
+    return {str(k): v for k, v in sheets.items()}
+
+
+@st.cache_data(show_spinner=False, max_entries=64, ttl=1800)
+def _cached_inspect(digest: str, ext: str, _b: bytes) -> list:
+    """Small per-file summary: one dict per sheet with detected header (0-based), data rows, columns."""
+    if ext == ".csv":
+        recs = _csv_preview(_b)
+        return [{"sheet": "CSV", "detected": detect_header_row(recs), "rows": None, "cols": None}]
+    out = []
+    for sh, raw in _cached_excel_raw(digest, ext, _b).items():
+        h = detect_header_row(raw.head(HEADER_SCAN_ROWS + _HEADER_LOOKAHEAD).values.tolist()) if not raw.empty else 0
+        t = _apply_header(raw, h)
+        out.append({"sheet": sh, "detected": int(h), "rows": int(len(t)),
+                    "cols": tuple(normalize_cols(t).columns) if len(t.columns) else tuple()})
+    return out
+
+
+def _file_entry(uf) -> dict:
+    """name / ext / bytes / sha256 for an uploaded file (digest memoised per upload in this session only)."""
+    b = uf.getvalue()
+    fid = getattr(uf, "file_id", "") or ""
+    digest = None
+    memo = None
+    if fid:
+        memo = st.session_state.setdefault("_file_digests", {})
+        digest = memo.get((uf.name, len(b), fid))
+    if digest is None:
+        digest = hashlib.sha256(b).hexdigest()
+        if memo is not None:
+            memo[(uf.name, len(b), fid)] = digest
+    return {"name": uf.name, "ext": _file_ext(uf.name), "b": b, "digest": digest}
+
+
+def _entries_for(files) -> list:
+    """File entries with a unique per-side key (same file uploaded twice gets '#2')."""
+    out, seen = [], {}
+    for uf in files or []:
+        e = _file_entry(uf)
+        if not e["ext"]:
+            raise ValueError(f"{uf.name}: unsupported file type. Upload CSV / XLSX / XLS / XLSB.")
+        k = f"{e['name']}|{e['digest'][:12]}"
+        seen[k] = seen.get(k, 0) + 1
+        e["key"] = k if seen[k] == 1 else f"{k}#{seen[k]}"
+        out.append(e)
+    return out
+
+
+def _inspect(e: dict) -> list:
+    if "info" not in e:
+        e["info"] = _cached_inspect(e["digest"], e["ext"], e["b"])
+    return e["info"]
+
+
+def default_sheet_selection(info: list) -> list:
+    """Same as before: the largest non-empty sheet + every other sheet with the same headers (workbook order)."""
+    non_empty = [s for s in info if s["rows"] is None or s["rows"] > 0]
+    if not non_empty:
+        return [info[0]["sheet"]] if info else []
+    if len(non_empty) == 1 or non_empty[0]["rows"] is None:
+        return [non_empty[0]["sheet"]]
+    base = max(non_empty, key=lambda s: s["rows"])
+    base_set = set(base["cols"])
+    return [s["sheet"] for s in non_empty if set(s["cols"]) == base_set]
+
+
+def _load_sheet(e: dict, sheet: str, header_row: int) -> pd.DataFrame:
+    if e["ext"] == ".csv":
+        return _cached_csv_table(e["digest"], int(header_row), e["b"])
+    raw = _cached_excel_raw(e["digest"], e["ext"], e["b"]).get(sheet)
+    return _apply_header(raw, int(header_row))
+
+
+def _read_entry(e: dict, cfg: dict = None):
+    """Read one file with its settings. Returns (df, sheets_used, header_desc)."""
+    info = _inspect(e)
+    det = {s["sheet"]: s["detected"] for s in info}
+    cfg = cfg or {}
+    sel = cfg.get("sheets")
+    if sel is None:
+        sel = default_sheet_selection(info)
+    sel = [s for s in sel if s in det]
+    hdrs = {s: int(cfg.get("headers", {}).get(s, det[s])) for s in sel}
+    name = e["name"]
+
+    if not sel:
+        st.warning(f"📑 {name}: no sheet selected, so this file is not used. Pick a sheet in ⚙️ File settings.")
+        return None, [], ""
+
+    parts = []
+    for sh in sel:
+        d = normalize_cols(_load_sheet(e, sh, hdrs[sh]))
+        if d is None or len(d.columns) == 0:
+            st.warning(f"📑 {name}{'' if sh == 'CSV' else ' / ' + sh}: nothing found from header row {hdrs[sh] + 1} down. "
+                       f"Check the header row in ⚙️ File settings.")
+            continue
+        d = d.copy()
+        d["_SHEET"] = str(sh)
+        parts.append((sh, d))
+
+    # notes about sheets (Excel only)
+    if e["ext"] != ".csv":
+        non_empty = [s["sheet"] for s in info if s["rows"] and s["rows"] > 0]
+        not_used = [s for s in non_empty if s not in sel]
+        default = default_sheet_selection(info)
+        if len(parts) > 1:
+            col_sets = [set(c for c in d.columns if c != "_SHEET") for _, d in parts]
+            if all(cs == col_sets[0] for cs in col_sets):
+                st.warning(f"📑 {name}: combined {len(parts)} sheets with identical headers: {', '.join(s for s, _ in parts)}. "
+                           f"If one of them is a copy/backup, remove it (copies will show up as duplicates).")
+            else:
+                allc = set().union(*col_sets)
+                miss = []
+                for (sh, _), cs in zip(parts, col_sets):
+                    m = sorted(allc - cs)
+                    if m:
+                        miss.append(f"'{sh}' has no {', '.join(m[:6])}{' …' if len(m) > 6 else ''}")
+                st.warning(f"📑 {name}: the selected sheets have different columns. All columns are kept and cells are "
+                           f"left blank where a sheet doesn't have that column ({'; '.join(miss)}). "
+                           f"Rows with a blank key will be listed as blank-key rows.")
+        if not_used:
+            if list(sel) == list(default):
+                st.warning(f"📑 {name}: skipped sheet(s) with different headers: {', '.join(not_used)}. "
+                           f"To include them, select them in ⚙️ File settings.")
+            else:
+                st.info(f"📑 {name}: sheet(s) not used: {', '.join(not_used)}.")
+
+    header_desc = "; ".join((f"{hdrs[sh] + 1}" if sh == "CSV" else f"{sh}: {hdrs[sh] + 1}") for sh, _ in parts)
+    if not parts:
+        return None, [], ""
+    df = pd.concat([d for _, d in parts], ignore_index=True, sort=False)
+    return df, [sh for sh, _ in parts], header_desc
+
+
+def read_file_once(uploaded_file, cfg: dict = None) -> pd.DataFrame:
     """
-    Reads CSV/XLSX/XLS/XLSB.
-    For Excel files: reads ALL sheets and picks the sheet with MAX rows.
-    Adds _SHEET column so summary can show which sheet was picked.
+    Reads CSV/XLSX/XLS/XLSB with automatic header-row detection (or the header row / sheets in cfg).
+    Excel default: largest sheet + same-header sheets. Adds _SHEET column.
     """
-    name = uploaded_file.name.lower()
-    b = uploaded_file.getvalue()
-    bio = io.BytesIO(b)
+    e = _entries_for([uploaded_file])[0]
+    df, _, _ = _read_entry(e, cfg)
+    if df is None:
+        df = pd.DataFrame(columns=["_SHEET"])
+    df = _dedup_columns(df)      # ✅ FIX 1
+    df = _fix_mixed_types(df)    # ✅ FIX 2
+    return df
 
-    if name.endswith(".csv"):
-        df = pd.read_csv(bio, dtype=str)   # ✅ FIX: read as TEXT (keeps leading zeros / long IDs)
-        df = _dedup_columns(df)      # ✅ FIX 1
-        df = _fix_mixed_types(df)    # ✅ FIX 2
-        df["_SHEET"] = "CSV"
-        return df
 
-    elif name.endswith((".xlsx", ".xls")):
-        sheets = pd.read_excel(bio, sheet_name=None, dtype=str)   # ✅ FIX: TEXT dtype
-        best_df = _combine_sheets(sheets, uploaded_file.name)       # ✅ FIX: all same-header sheets
-        best_df = _dedup_columns(best_df)    # ✅ FIX 1
-        best_df = _fix_mixed_types(best_df)  # ✅ FIX 2
-        return best_df
-
-    elif name.endswith(".xlsb"):
-        sheets = pd.read_excel(bio, engine="pyxlsb", sheet_name=None, dtype=str)   # ✅ FIX: TEXT dtype
-        best_df = _combine_sheets(sheets, uploaded_file.name)                       # ✅ FIX: all same-header sheets
-        best_df = _dedup_columns(best_df)    # ✅ FIX 1
-        best_df = _fix_mixed_types(best_df)  # ✅ FIX 2
-        return best_df
-
-    else:
-        raise ValueError("Unsupported file type. Upload CSV / XLSX / XLSB.")
-    
-def read_many(files):
+def read_many(files, settings: dict = None):
     """
     Combine many files into ONE dataframe (append rows).
+    settings: {file_key: {"sheets": [...], "headers": {sheet: 0-based row}}} from the File settings UI
+              (missing = automatic detection + default sheets).
     Returns: (combined_df, file_summary_df)
-    file_summary_df columns: File, Sheet, Rows, Size_KB, Time_Sec
+    file_summary_df columns: File, Sheet, Header_Row, Rows, Size_KB, Time_Sec
     Adds GRAND TOTAL row at bottom.
     Shows progress + time while reading.
     """
+    settings = settings or {}
     dfs = []
     meta = []
 
     prog = st.progress(0)
     status = st.empty()
 
-    total_files = len(files) if files else 0
+    entries = _entries_for(files)
+    total_files = len(entries)
 
-    for i, uf in enumerate(files, start=1):
+    for i, e in enumerate(entries, start=1):
         t0 = time.time()
-        status.info(f"Reading file {i}/{total_files}: {uf.name}")
-
-        df = normalize_cols(read_file_once(uf))
-        df["_SOURCE_FILE"] = uf.name
+        status.info(f"Reading file {i}/{total_files}: {e['name']}")
+        try:
+            df, used, header_desc = _read_entry(e, settings.get(e["key"]))
+        except Exception as ex:
+            raise ValueError(f"{e['name']}: {ex}") from ex
+        if df is None:
+            continue
+        df = _fix_mixed_types(_dedup_columns(df))
+        df = normalize_cols(df)
+        df["_SOURCE_FILE"] = e["name"]
         dfs.append(df)
 
         elapsed = round(time.time() - t0, 2)
 
         meta.append({
-            "File": uf.name,
-            "Sheet": ", ".join(pd.unique(df["_SHEET"].astype(str))) if ("_SHEET" in df.columns and len(df) > 0) else "UNKNOWN",
+            "File": e["name"],
+            "Sheet": ", ".join(used) if used else "UNKNOWN",
+            "Header_Row": header_desc,
             "Rows": int(len(df)),
-            "Size_KB": round(len(uf.getvalue()) / 1024, 1),
+            "Size_KB": round(len(e["b"]) / 1024, 1),
             "Time_Sec": elapsed
         })
 
@@ -388,8 +661,8 @@ def read_many(files):
     status.success("✅ File reading completed")
     prog.progress(100)
 
-    combined = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-    summary = pd.DataFrame(meta) if meta else pd.DataFrame(columns=["File", "Sheet", "Rows", "Size_KB", "Time_Sec"])
+    combined = pd.concat(dfs, ignore_index=True, sort=False) if dfs else pd.DataFrame()
+    summary = pd.DataFrame(meta) if meta else pd.DataFrame(columns=["File", "Sheet", "Header_Row", "Rows", "Size_KB", "Time_Sec"])
 
     if not summary.empty:
         summary = summary.sort_values(["Rows", "File"], ascending=[False, True])
@@ -397,6 +670,7 @@ def read_many(files):
         grand = {
             "File": "GRAND TOTAL",
             "Sheet": "",
+            "Header_Row": "",
             "Rows": int(summary["Rows"].sum()),
             "Size_KB": round(float(summary["Size_KB"].sum()), 1),
             "Time_Sec": round(float(summary["Time_Sec"].sum()), 2)
@@ -404,6 +678,79 @@ def read_many(files):
         summary = pd.concat([summary, pd.DataFrame([grand])], ignore_index=True)
 
     return combined, summary
+
+
+def file_settings_ui(side_label: str, side_key: str, files) -> dict:
+    """
+    ✅ NEW: compact per-side '⚙️ File settings' expander.
+    - Excel with >1 non-empty sheet: multiselect of sheets (with row counts); default = largest + same-header sheets.
+    - Every CSV / selected sheet: 'Header row' (1-based) prefilled with the detected row.
+    Widget keys are stable per side + file name + content hash + sheet, so changing one value re-reads only that file.
+    Returns settings for read_many().
+    """
+    try:
+        entries = _entries_for(files)
+        for e in entries:
+            _inspect(e)
+    except Exception as ex:
+        st.error(f"Error reading files: {ex}")
+        st.stop()
+
+    notes = []
+    for e in entries:
+        info = e["info"]
+        non_empty = [s for s in info if s["rows"] is None or s["rows"] > 0]
+        if e["ext"] != ".csv" and len(non_empty) > 1:
+            notes.append(f"📑 **{e['name']}** has {len(non_empty)} sheets with data. Choose which to use in ⚙️ settings below.")
+        for s in default_sheet_selection(info):
+            d = next(x["detected"] for x in info if x["sheet"] == s)
+            if d > 0:
+                where = "" if s == "CSV" else f" (sheet '{s}')"
+                notes.append(f"🔎 {e['name']}{where}: header detected on row {d + 1}.")
+    for n_ in notes[:6]:
+        st.caption(n_)
+    if len(notes) > 6:
+        st.caption(f"… and {len(notes) - 6} more notes in ⚙️ settings.")
+
+    settings = {}
+    with st.expander(f"⚙️ {side_label} settings: header row / sheets", expanded=False):
+        for e in entries:
+            info = e["info"]
+            det = {s["sheet"]: s["detected"] for s in info}
+            rows = {s["sheet"]: s["rows"] for s in info}
+            non_empty = [s["sheet"] for s in info if s["rows"] is None or s["rows"] > 0]
+            base_key = f"{side_key}|{e['key']}"
+            st.markdown(f"**{e['name']}**")
+            if e["ext"] != ".csv" and len(non_empty) > 1:
+                sel = st.multiselect(
+                    "Sheets to use",
+                    options=non_empty,
+                    default=default_sheet_selection(info),
+                    format_func=lambda s, _r=rows: f"{s} ({_r.get(s) or 0:,} rows)",
+                    key=f"sheets|{base_key}",
+                    help="Rows from the selected sheets are combined. Default = the largest sheet plus sheets with the same headers.",
+                )
+            else:
+                sel = default_sheet_selection(info)
+            headers = {}
+            for sh in sel:
+                d1 = int(det.get(sh, 0)) + 1
+                hv = st.number_input(
+                    "Header row" if sh == "CSV" or len(sel) == 1 else f"Header row: {sh}",
+                    min_value=1, max_value=100000, value=d1, step=1,
+                    key=f"hdr|{base_key}|{sh}",
+                    help="Row number (1 = first row) that has the column names. Rows above it are ignored.",
+                )
+                hv = int(hv)
+                st.caption(f"Header detected on row {d1}" + ("" if hv == d1 else f" · using row {hv}"))
+                headers[sh] = hv - 1
+            settings[e["key"]] = {"sheets": list(sel), "headers": headers}
+    return settings
+
+
+def settings_signature(settings: dict) -> tuple:
+    return tuple(sorted((k, tuple(v.get("sheets", [])), tuple(sorted(v.get("headers", {}).items())))
+                        for k, v in (settings or {}).items()))
 
 # ✅ treat '-' etc as blank (✅ FIX: also 'nan' and Excel error values like #N/A)
 _BLANK_TOKENS = {"-", "--", "na", "n/a", "null", "none", "nan",
@@ -1078,6 +1425,8 @@ with col1:
         key="file1",
         accept_multiple_files=True
     )
+    # ✅ NEW v1.7: header row + sheet picker per file
+    f1_settings = file_settings_ui("File 1", "f1", f1_list) if f1_list else {}
 with col2:
     f2_list = st.file_uploader(
         "Upload File 2 (multiple allowed)",
@@ -1085,6 +1434,8 @@ with col2:
         key="file2",
         accept_multiple_files=True
     )
+    # ✅ NEW v1.7: header row + sheet picker per file
+    f2_settings = file_settings_ui("File 2", "f2", f2_list) if f2_list else {}
 
 if not (f1_list and f2_list):
     st.info("Upload at least 1 file on both sides to start.")
@@ -1097,17 +1448,23 @@ if not (f1_list and f2_list):
 # ✅ FIX: include Streamlit's per-upload file_id so re-uploading a corrected file with same name+size is detected
 sig1 = tuple((f.name, len(f.getvalue()), getattr(f, "file_id", "")) for f in f1_list)
 sig2 = tuple((f.name, len(f.getvalue()), getattr(f, "file_id", "")) for f in f2_list)
-sig = (sig1, sig2)
+# ✅ NEW v1.7: header-row / sheet choices are part of the signature (changing them re-reads; unchanged files come from cache)
+sig = (sig1, sig2, settings_signature(f1_settings), settings_signature(f2_settings))
 # ✅ upload signature for caching (search index / exports)
 st.session_state["upload_signature"] = str(sig)
 
 if st.session_state.get("files_sig") != sig:
     try:
-        df1, f1_summary = read_many(f1_list)
-        df2, f2_summary = read_many(f2_list)
+        df1, f1_summary = read_many(f1_list, f1_settings)
+        df2, f2_summary = read_many(f2_list, f2_settings)
     except Exception as e:
         st.error(f"Error reading files: {e}")
         st.stop()
+    # ✅ NEW v1.7: clear message when a side has no usable columns (e.g. header row set past the end / no sheet selected)
+    for _lbl, _d in (("File 1", df1), ("File 2", df2)):
+        if not [c for c in _d.columns if c not in ("_SHEET", "_SOURCE_FILE")]:
+            st.error(f"❌ {_lbl}: no columns found. Check the header row / sheets in ⚙️ {_lbl} settings.")
+            st.stop()
     st.session_state["files_sig"] = sig
     st.session_state["df1"] = df1
     st.session_state["df2"] = df2
@@ -1176,11 +1533,11 @@ else:
     df2 = st.session_state["df2"]
     f1_summary = st.session_state.get(
         "f1_summary",
-        pd.DataFrame(columns=["File", "Sheet", "Rows", "Size_KB", "Time_Sec"])
+        pd.DataFrame(columns=["File", "Sheet", "Header_Row", "Rows", "Size_KB", "Time_Sec"])
     )
     f2_summary = st.session_state.get(
         "f2_summary",
-        pd.DataFrame(columns=["File", "Sheet", "Rows", "Size_KB", "Time_Sec"])
+        pd.DataFrame(columns=["File", "Sheet", "Header_Row", "Rows", "Size_KB", "Time_Sec"])
     )
 
 # -----------------------------
