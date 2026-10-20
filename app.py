@@ -27,13 +27,16 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 creds  = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
 gc     = gspread.authorize(creds)
 sheet  = gc.open_by_key(st.secrets["SHEET_ID"]).sheet1
-rows   = sheet.get_all_records()
+# ✅ FIX: read every cell as TEXT so PINs like "0123" keep their leading zero
+try:
+    rows = sheet.get_all_records(numericise_ignore=["all"])
+except TypeError:  # very old gspread without numericise_ignore
+    rows = sheet.get_all_records()
 user_email = st.query_params.get("email", "")
 user_pin   = st.query_params.get("pin", "")
 
 if not user_email:
-    st.markdown("""...""")
-    st.stop()
+    # ✅ FIX: show the message BEFORE st.stop() (previously the page was blank)
     st.error("❌ Access denied. Contact aarohisharma5000@gmail.com for your link.")
     st.stop()
 user_row = next((r for r in rows if str(r.get("email","")).strip().lower() == user_email.strip().lower()), None)
@@ -41,14 +44,19 @@ if not user_row:
     st.error(f"❌ {user_email} is not subscribed.")
     st.stop()
 
-expiry = date.fromisoformat(str(user_row["expiry_date"]))
+# ✅ FIX: a badly formatted expiry_date no longer crashes the app
+try:
+    expiry = date.fromisoformat(str(user_row.get("expiry_date", "")).strip()[:10])
+except ValueError:
+    st.error("⚠️ Your subscription record has an invalid expiry date. Please contact aarohisharma5000@gmail.com.")
+    st.stop()
 if expiry < date.today():
     st.error(f"⏰ Subscription expired on {expiry}. Please renew.")
     st.stop()
 
 # ── PIN CHECK ──
 correct_pin = str(user_row.get("pin","")).strip()
-if correct_pin and user_pin != correct_pin:
+if correct_pin and str(user_pin).strip() != correct_pin:
     st.markdown("""
     <div style="text-align:center; padding:3rem 2rem;">
         <div style="font-size:2rem; margin-bottom:1rem;">🔐</div>
@@ -66,7 +74,7 @@ if correct_pin and user_pin != correct_pin:
     st.stop()
 # ── PIN PASSED ──    
 plan = str(user_row.get("plan","free")).strip().lower()
-ROW_LIMIT = {"free":100,"starter":250000,"pro":9999999}.get(plan,100)
+ROW_LIMIT = {"free":100,"basic":250000,"starter":250000,"pro":9999999}.get(plan,100)  # ✅ FIX: 'basic' plan added (unknown plan names get the free limit)
 st.session_state["user_plan"] = plan
 st.session_state["row_limit"] = ROW_LIMIT
 # ── AUTH PASSED ──
@@ -102,7 +110,7 @@ show_help = False
 import streamlit as st
 _plan = st.session_state.get("user_plan", "")
 _email = st.session_state.get("user_email", "")
-_plan_label = {"free":"🆓 Free — 100 rows","starter":"⭐ Starter Plan","pro":"🏆 Pro Plan"}.get(_plan,"")
+_plan_label = {"free":"🆓 Free — 100 rows","basic":"⭐ Basic Plan","starter":"⭐ Starter Plan","pro":"🏆 Pro Plan"}.get(_plan,"")
 st.markdown(f"""
 <style>
   .reco-header {{
@@ -274,6 +282,39 @@ def _fix_mixed_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _combine_sheets(sheets: dict, file_name: str) -> pd.DataFrame:
+    """
+    ✅ FIX: previously only the sheet with MAX rows was read and every other sheet was silently ignored.
+    Now: the largest sheet defines the headers; every non-empty sheet with the SAME headers is appended
+    (workbook order). Sheets with different headers are skipped and listed in a warning.
+    _SHEET is set per row.
+    """
+    non_empty = [(sh, d) for sh, d in sheets.items() if d is not None and not d.dropna(how="all").empty]
+    if not non_empty:
+        out = pd.DataFrame()
+        out["_SHEET"] = "UNKNOWN"
+        return out
+    base_sh, base_df = max(non_empty, key=lambda x: len(x[1]))
+    base_set = set(normalize_cols(base_df).columns)
+    parts, used, skipped = [], [], []
+    for sh, d in non_empty:
+        dn = normalize_cols(d)
+        if set(dn.columns) == base_set:
+            dn = dn.copy()
+            dn["_SHEET"] = str(sh)
+            parts.append(dn)
+            used.append(str(sh))
+        else:
+            skipped.append(str(sh))
+    if len(used) > 1:
+        st.warning(f"📑 {file_name}: combined {len(used)} sheets with identical headers: {', '.join(used)}. "
+                   f"If one of them is a copy/backup, remove it (copies will show up as duplicates).")
+    if skipped:
+        st.warning(f"📑 {file_name}: skipped sheet(s) with different headers: {', '.join(skipped)} "
+                   f"(only sheets with the same headers as '{base_sh}' are used).")
+    return pd.concat(parts, ignore_index=True)
+
+
 def read_file_once(uploaded_file) -> pd.DataFrame:
     """
     Reads CSV/XLSX/XLS/XLSB.
@@ -285,44 +326,24 @@ def read_file_once(uploaded_file) -> pd.DataFrame:
     bio = io.BytesIO(b)
 
     if name.endswith(".csv"):
-        df = pd.read_csv(bio)
+        df = pd.read_csv(bio, dtype=str)   # ✅ FIX: read as TEXT (keeps leading zeros / long IDs)
         df = _dedup_columns(df)      # ✅ FIX 1
         df = _fix_mixed_types(df)    # ✅ FIX 2
         df["_SHEET"] = "CSV"
         return df
 
     elif name.endswith((".xlsx", ".xls")):
-        sheets = pd.read_excel(bio, sheet_name=None)
-        best_sheet, best_df, best_rows = None, None, -1
-        for sh, dfx in sheets.items():
-            if dfx is None:
-                continue
-            rows = len(dfx)
-            if rows > best_rows:
-                best_rows = rows
-                best_sheet = sh
-                best_df = dfx
-        best_df = best_df if best_df is not None else pd.DataFrame()
+        sheets = pd.read_excel(bio, sheet_name=None, dtype=str)   # ✅ FIX: TEXT dtype
+        best_df = _combine_sheets(sheets, uploaded_file.name)       # ✅ FIX: all same-header sheets
         best_df = _dedup_columns(best_df)    # ✅ FIX 1
         best_df = _fix_mixed_types(best_df)  # ✅ FIX 2
-        best_df["_SHEET"] = str(best_sheet) if best_sheet is not None else "UNKNOWN"
         return best_df
 
     elif name.endswith(".xlsb"):
-        sheets = pd.read_excel(bio, engine="pyxlsb", sheet_name=None)
-        best_sheet, best_df, best_rows = None, None, -1
-        for sh, dfx in sheets.items():
-            if dfx is None:
-                continue
-            rows = len(dfx)
-            if rows > best_rows:
-                best_rows = rows
-                best_sheet = sh
-                best_df = dfx
-        best_df = best_df if best_df is not None else pd.DataFrame()
+        sheets = pd.read_excel(bio, engine="pyxlsb", sheet_name=None, dtype=str)   # ✅ FIX: TEXT dtype
+        best_df = _combine_sheets(sheets, uploaded_file.name)                       # ✅ FIX: all same-header sheets
         best_df = _dedup_columns(best_df)    # ✅ FIX 1
         best_df = _fix_mixed_types(best_df)  # ✅ FIX 2
-        best_df["_SHEET"] = str(best_sheet) if best_sheet is not None else "UNKNOWN"
         return best_df
 
     else:
@@ -356,7 +377,7 @@ def read_many(files):
 
         meta.append({
             "File": uf.name,
-            "Sheet": df["_SHEET"].iloc[0] if ("_SHEET" in df.columns and len(df) > 0) else "UNKNOWN",
+            "Sheet": ", ".join(pd.unique(df["_SHEET"].astype(str))) if ("_SHEET" in df.columns and len(df) > 0) else "UNKNOWN",
             "Rows": int(len(df)),
             "Size_KB": round(len(uf.getvalue()) / 1024, 1),
             "Time_Sec": elapsed
@@ -384,7 +405,10 @@ def read_many(files):
 
     return combined, summary
 
-# ✅ treat '-' etc as blank
+# ✅ treat '-' etc as blank (✅ FIX: also 'nan' and Excel error values like #N/A)
+_BLANK_TOKENS = {"-", "--", "na", "n/a", "null", "none", "nan",
+                 "#n/a", "#value!", "#ref!", "#div/0!", "#name?", "#null!", "#num!"}
+
 def is_blank(x) -> bool:
     if pd.isna(x):
         return True
@@ -392,9 +416,25 @@ def is_blank(x) -> bool:
         t = x.strip().lower()
         if t == "":
             return True
-        if t in {"-", "--", "na", "n/a", "null", "none"}:
+        if t in _BLANK_TOKENS:
             return True
     return False
+
+def blank_mask(s: pd.Series) -> pd.Series:
+    """✅ Vectorised is_blank() for a whole column (same rules, much faster)."""
+    t = s.astype(str).str.strip().str.lower()
+    return (s.isna() | (t == "") | t.isin(_BLANK_TOKENS)).astype(bool)
+
+def to_num(s) -> pd.Series:
+    """✅ Explicit text -> number conversion (files are read as text). Strips commas/spaces; non-numbers -> NaN."""
+    if s is None:
+        return pd.Series([], dtype="float64")
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return pd.to_numeric(s, errors="coerce").astype("float64")
+    t = s.astype("string").str.replace(",", "", regex=False).str.replace("\u00A0", "", regex=False).str.strip()
+    return pd.to_numeric(t, errors="coerce").astype("float64")
 
 def uniq_list(seq):
     seen = set()
@@ -412,9 +452,18 @@ TEXT_NAME_KEYWORDS = [
     "loan account", "lender loan", "account number", "lan", "loan id", "customer id", "id"
 ]
 
+# ✅ FIX: whole-word / exact-name matching. The old substring check ('lan', 'id') wrongly
+#    flagged 'Principal Balance', 'Paid Amount', 'Plan', 'Holiday', 'Provider' as TEXT.
+_TEXT_TOKENS = {"id", "lan", "code", "ref", "pin", "pincode", "mobile", "phone", "ifsc", "pan", "utr", "no"}
+
 def is_text_by_name(col: str) -> bool:
     lc = str(col).strip().lower()
-    return any(k in lc for k in TEXT_NAME_KEYWORDS)
+    tokens = set(re.split(r"[^a-z0-9]+", lc)) - {""}
+    if tokens & _TEXT_TOKENS:
+        return True
+    if (tokens & {"account", "acct", "acc"}) and (tokens & {"number", "no", "num"}):
+        return True
+    return re.sub(r"[^a-z0-9]+", "", lc) in _TEXT_EXACT_NAMES
 
 def is_numeric_column(df_both: pd.DataFrame, col: str) -> bool:
     try:
@@ -435,11 +484,11 @@ def is_numeric_column(df_both: pd.DataFrame, col: str) -> bool:
         if len(s1) == 0 or len(s2) == 0:
             return False
 
-        nb1 = ~s1.apply(is_blank)
-        nb2 = ~s2.apply(is_blank)
+        nb1 = ~blank_mask(s1)
+        nb2 = ~blank_mask(s2)
 
-        n1 = pd.to_numeric(s1, errors="coerce")
-        n2 = pd.to_numeric(s2, errors="coerce")
+        n1 = to_num(s1)
+        n2 = to_num(s2)
 
         nb1_sum = int(nb1.sum()) if hasattr(nb1.sum(), '__int__') else 1
         nb2_sum = int(nb2.sum()) if hasattr(nb2.sum(), '__int__') else 1
@@ -528,18 +577,23 @@ KEY_CANDIDATES_PRIORITY = [
     "customer id",
     "loan id",
     "lender account number",
-    "Transaction Id"
-    "Transaction id"
-    "TransactionId"
-    "TransactionID"
+    "Transaction Id",      # ✅ FIX: commas were missing, so these 4 names were glued into one string
+    "Transaction id",
+    "TransactionId",
+    "TransactionID",
 ]
 
 # Smart key suggestion (scans column names, returns best-guess key cols)
 _KEY_HINTS = [
     "lenderloanaccountnumber", "loanaccountnumber", "loanacctnumber",
     "loanaccnumber", "lan", "accountnumber", "loanid", "lenderaccountnumber",
-    "customerid", "borrowerid", "accountid","Transaction Id"
+    "customerid", "borrowerid", "accountid", "transactionid"   # ✅ FIX: normalised (was "Transaction Id", never matched)
 ]
+
+# ✅ Exact (normalised) column names that are always TEXT identifiers
+_TEXT_EXACT_NAMES = {re.sub(r"[^a-z0-9]+", "", str(x).lower()) for x in KEY_CANDIDATES_PRIORITY + _KEY_HINTS} | {
+    "customerid", "loanid", "borrowerid", "accountid", "transactionid", "lan", "lanno", "loanno"
+}
 
 def suggest_key_candidates(cols: list, top_k: int = 5) -> list:
     """
@@ -554,6 +608,7 @@ def suggest_key_candidates(cols: list, top_k: int = 5) -> list:
 
         # ✅ Standard finance key hints — high score
         for h in _KEY_HINTS:
+            h = re.sub(r"[^a-z0-9]+", "", str(h).lower())   # ✅ FIX: case/space-insensitive hint match
             if h in n:
                 score += 10
 
@@ -631,7 +686,7 @@ def build_effective_key(df: pd.DataFrame, candidates: list):
             continue
 
         s = df[actual]
-        valid = ~s.apply(is_blank)
+        valid = ~blank_mask(s)
         fill_mask = (raw_key == "") & valid
         if fill_mask.any():
             raw_key.loc[fill_mask] = s.loc[fill_mask].astype(str)
@@ -674,21 +729,34 @@ def aggregate_by_key_fast(df: pd.DataFrame, key_col: str, numeric_cols: list, jo
     if key_col not in df.columns:
         return df
 
-    dup_counts = df.groupby(key_col, dropna=False).size().rename("_DUP_COUNT").reset_index()
+    # ✅ PERF: vectorised version of the old per-group Python agg (same output, ~10x faster)
+    g = df.groupby(key_col, dropna=False, sort=True)
+    dup_counts = g.size().rename("_DUP_COUNT")
+    cols = [c for c in df.columns if c != key_col]
+    num = [c for c in cols if c in numeric_cols]
+    joins = [c for c in cols if c not in numeric_cols and c in join_cols]
+    others = [c for c in cols if c not in numeric_cols and c not in join_cols]
 
-    agg_map = {}
-    for c in df.columns:
-        if c == key_col:
-            continue
-        if c in numeric_cols:
-            agg_map[c] = "sum"
-        elif c in join_cols:
-            agg_map[c] = _join_unique_non_blank
-        else:
-            agg_map[c] = _first_non_blank
-
-    out = df.groupby(key_col, dropna=False).agg(agg_map).reset_index()
-    out = out.merge(dup_counts, on=key_col, how="left")
+    out = pd.DataFrame(index=dup_counts.index)
+    if num:
+        out = out.join(g[num].sum())
+    if others:
+        masked = pd.DataFrame({c: df[c].where(~blank_mask(df[c])) for c in others}, index=df.index)
+        masked[key_col] = df[key_col]
+        first_nb = masked.groupby(key_col, dropna=False, sort=True)[others].first()
+        raw_first = df.drop_duplicates(subset=[key_col], keep="first").set_index(key_col)[others]
+        first_nb = first_nb.astype(object).fillna(raw_first.reindex(first_nb.index).astype(object))
+        out = out.join(first_nb)
+    for c in joins:
+        tmp = df.loc[~blank_mask(df[c]), [key_col, c]]
+        tmp = tmp.assign(**{c: tmp[c].astype(str)}).drop_duplicates()
+        _multi = tmp[key_col].duplicated(keep=False)          # only keys with >1 distinct value need joining
+        joined = tmp.loc[~_multi].set_index(key_col)[c]
+        if _multi.any():
+            joined = pd.concat([joined, tmp.loc[_multi].groupby(key_col, dropna=False, sort=True)[c].agg("; ".join)])
+        out[c] = joined.reindex(out.index).fillna("")
+    out = out[cols].reset_index()
+    out = out.merge(dup_counts.reset_index(), on=key_col, how="left")
     return out
 
 # -----------------------------
@@ -841,14 +909,16 @@ def build_excel_bytes(sheets: dict) -> bytes:
     return bio.getvalue()
 
 
-def build_summary_pdf(pdf_path: Path, summary_df: pd.DataFrame, app_version: str, focus_col: str):
-    pdf_path = Path(pdf_path)
+def build_summary_pdf(pdf_path, summary_df: pd.DataFrame, app_version: str, focus_col: str):
+    """✅ FIX: pdf_path=None -> build the PDF in memory (per session) and return bytes. No shared file on disk."""
+    _buf = io.BytesIO() if pdf_path is None else None
+    pdf_path = Path(pdf_path) if pdf_path is not None else None
 
     from reportlab.lib.pagesizes import landscape, A4
     _page = landscape(A4)   # ✅ Force landscape explicitly
 
     doc = SimpleDocTemplate(
-        str(pdf_path),
+        _buf if _buf is not None else str(pdf_path),
         pagesize=_page,
         rightMargin=12 * mm,
         leftMargin=12 * mm,
@@ -980,17 +1050,19 @@ def build_summary_pdf(pdf_path: Path, summary_df: pd.DataFrame, app_version: str
     story.append(Spacer(1, 14))
 
     footer = Paragraph(
-        "This report is generated from Reconciliation Suite and runs locally on the user machine.",
+        "Generated by RecoSuite. Files are processed in your session on the RecoSuite cloud server and are not saved to disk by the tool.",
         styles["Italic"]
     )
     story.append(footer)
 
     doc.build(story)
+    return _buf.getvalue() if _buf is not None else None
 
 # -------------------------------------------------------------
 # Single CSV bytes helper (keep only one definition)
 # -------------------------------------------------------------
-@st.cache_data(show_spinner=False)
+# ✅ FIX: no st.cache_data here (that cache is global across ALL users and grows forever);
+#    bytes are already kept per-session in st.session_state.
 def _df_to_csv_bytes(_sig: str, df: pd.DataFrame) -> bytes:
     dfx = df if df is not None else pd.DataFrame()
     return dfx.to_csv(index=False).encode("utf-8")
@@ -1022,8 +1094,9 @@ if not (f1_list and f2_list):
 # -----------------------------
 # Read ONCE (per upload set)
 # -----------------------------
-sig1 = tuple((f.name, len(f.getvalue())) for f in f1_list)
-sig2 = tuple((f.name, len(f.getvalue())) for f in f2_list)
+# ✅ FIX: include Streamlit's per-upload file_id so re-uploading a corrected file with same name+size is detected
+sig1 = tuple((f.name, len(f.getvalue()), getattr(f, "file_id", "")) for f in f1_list)
+sig2 = tuple((f.name, len(f.getvalue()), getattr(f, "file_id", "")) for f in f2_list)
 sig = (sig1, sig2)
 # ✅ upload signature for caching (search index / exports)
 st.session_state["upload_signature"] = str(sig)
@@ -1060,6 +1133,7 @@ if st.session_state.get("files_sig") != sig:
         "only_f1_out", "only_f2_out",
         "dup_rows_1_out", "dup_rows_2_out", "dup_both_out",
         "miss_cols_f1", "miss_cols_f2",
+        "summary_pdf_bytes", "blank_key_out",
         # ✅ f1_summary / f2_summary NOT deleted here — they are set by read_many above
     ]:
         if k in st.session_state:
@@ -1117,24 +1191,30 @@ df1 = normalize_cols(df1)
 df2 = normalize_cols(df2)
 st.session_state["df1"] = df1
 st.session_state["df2"] = df2
-# ── FREE PLAN ROW LIMIT CHECK ──
-# ── FREE PLAN ROW LIMIT CHECK ──
-if st.session_state.get("user_plan","free") == "free":
+# ── PLAN ROW LIMIT CHECK ──
+# ✅ FIX: free plan = always 100 rows (applied AFTER key cleaning in the Run step: first 100 rows of
+#    File 1 + the File 2 rows with the same keys + up to 100 other File 2 rows).
+#    Paid plans: per-side limit from ROW_LIMIT is enforced (previously never checked).
+_row_limit = int(st.session_state.get("row_limit", 100))
+_is_free_plan = _row_limit <= 100
+st.session_state["is_free_plan"] = _is_free_plan
+if _is_free_plan:
     _total = len(df1) + len(df2)
-    if _total > 200:
+    if len(df1) > 100 or len(df2) > 100:
         st.markdown("""
         <div style="background:#fff3cd; border:1px solid #ffc107; border-radius:12px;
                     padding:1rem 1.5rem; margin:0.5rem 0;">
             <b>🆓 Free Plan — Demo Mode</b><br>
-            Showing first <b>100 rows from each file</b> for preview.
+            Reconciliation will use the <b>first 100 rows of File 1</b> and the matching File 2 rows.
             Your files have <b>{:,} rows</b> total.
-            Full reconciliation available on paid plans.
+            Full reconciliation and downloads are available on paid plans.
         </div>
         """.format(_total), unsafe_allow_html=True)
-        df1 = df1.head(100)
-        df2 = df2.head(100)
-        st.session_state["df1"] = df1
-        st.session_state["df2"] = df2
+elif len(df1) > _row_limit or len(df2) > _row_limit:
+    st.error(f"🚫 Your plan allows up to {_row_limit:,} rows per side. "
+             f"File 1 has {len(df1):,} rows and File 2 has {len(df2):,} rows. "
+             f"Please split the files or upgrade your plan.")
+    st.stop()
 common_cols = sorted(list(set(df1.columns).intersection(set(df2.columns))))
 internal_cols = {"_SOURCE_FILE", "_KEY", "_merge", "_SHEET"}
 matched_cols = [c for c in common_cols if c not in internal_cols]
@@ -1652,6 +1732,7 @@ with c1:
     st.write("✅ Key is COALESCE (no detection).")
     st.caption("If Lender Loan Account Number is blank, uses loan account number automatically.")
     st.caption("Only-in File1/File2 are never counted as mismatches.")
+    st.caption("✅ A row is **Mismatched** if ANY selected compare column differs (numbers beyond the tolerance, text not exactly equal). Key columns are not compared. The Summary 'Particular' column is used for the totals.")
     st.caption("Step-2 aggregation is optimized to only required columns.")
 
 if compare_mode == "Compare selected columns" and not compare_cols:
@@ -1689,22 +1770,34 @@ picked_values = []
 if filter_enabled:
     use_picker = st.checkbox("Show available values (dropdown)", value=True)
     if use_picker:
-        @st.cache_data(show_spinner=False)
-        def _get_unique_filter_vals(_sig, col, limit=5000):
-            """Get unique values from df1+df2 for the filter column (cached by upload sig)."""
-            vals = []
+        # ✅ FIX (data leak): this was @st.cache_data with the upload signature in an "_sig" argument.
+        #    Streamlit does NOT hash "_"-prefixed arguments and the cache is shared by ALL users, so one
+        #    customer could see another customer's filter values. Now cached per-session only.
+        def _get_unique_filter_vals(sig_key, col, limit=5000):
+            """Get unique values from df1+df2 for the filter column (cached in THIS session only)."""
+            _ck = f"_filter_vals::{sig_key}::{col}"
+            if _ck in st.session_state:
+                return st.session_state[_ck]
+            vals, seen, truncated = [], set(), False
             for _df in [df1, df2]:
                 if col in _df.columns:
                     for v in _df[col].dropna().astype(str).str.strip().unique():
-                        if v and v not in vals:
+                        if v and v not in seen:
+                            seen.add(v)
                             vals.append(v)
                         if len(vals) >= limit:
-                            return vals, True
-            vals.sort()
-            return vals, False
+                            truncated = True
+                            break
+                if truncated:
+                    break
+            if not truncated:
+                vals.sort()
+            st.session_state[_ck] = (vals, truncated)
+            return vals, truncated
 
         _fvals, _truncated = _get_unique_filter_vals(
-            st.session_state.get("files_sig", ""), filter_col
+            str(st.session_state.get("files_sig", "")) + "|" + str(sorted(st.session_state.get("col_mapping", {}).items())),
+            filter_col
         )
         if _truncated:
             st.info("Showing first 5,000 unique values. You can still type values manually below.")
@@ -1771,7 +1864,7 @@ def build_selected_field_summary_before_run(df_side: pd.DataFrame, focus_col: st
     if focus_col not in tmp.columns:
         tmp[focus_col] = 0
 
-    tmp["_FOCUS_NUM"] = pd.to_numeric(tmp[focus_col], errors="coerce").fillna(0)
+    tmp["_FOCUS_NUM"] = to_num(tmp[focus_col]).fillna(0)
 
     g = tmp.groupby(["_SOURCE_FILE", "_SHEET"], dropna=False).agg(
         Rows=("_FOCUS_NUM", "size"),
@@ -1842,7 +1935,11 @@ run_inputs_sig = (
     str(bool(treat_blanks_as_equal)) + "|" +
     str(bool(skip_mismatch_columns)) + "|" +
     _filter_sig + "|" +
-    _dup_mode_sig
+    _dup_mode_sig + "|" +
+    # ✅ FIX: key columns, column mapping and plan limit are part of the signature (were ignored -> stale results)
+    "|".join(existing_key_candidates) + "|" +
+    str(sorted(st.session_state.get("col_mapping", {}).items())) + "|" +
+    str(st.session_state.get("row_limit", ""))
 )
 
 RUN_CACHE_KEYS = [
@@ -1855,7 +1952,8 @@ RUN_CACHE_KEYS = [
     "dup_union", "dup_keys_1", "dup_keys_2",
     "dup_f1_key_count", "dup_f2_key_count",
     # ✅ ADD: track which mode was used so UI shows correct tip
-    "_has_dups", "_exclude_dups"
+    "_has_dups", "_exclude_dups",
+    "summary_pdf_bytes", "blank_key_out",
 ]
 has_cached_run = (
     st.session_state.get("run_cache_sig") == run_inputs_sig and
@@ -1907,6 +2005,8 @@ if has_cached_run:
     dup_f2_key_count = st.session_state.get("dup_f2_key_count", len(dup_keys_2))
     _has_dups        = st.session_state.get("_has_dups", False)
     _exclude_dups    = st.session_state.get("_exclude_dups", False)
+    summary_pdf_bytes = st.session_state.get("summary_pdf_bytes", b"")
+    blank_key_out    = st.session_state.get("blank_key_out", pd.DataFrame())
     st.info("✅ Using cached Run results (no recomputation on download).")
     progress_update(6, TOTAL_STEPS, "Using cached results (skipping recompute)...")
 
@@ -1950,6 +2050,45 @@ if not skip_recompute:
     # Loan account keys are TEXT-like → preserve alphanumerics
     df1_raw["_KEY"] = clean_key_series(raw1, treat_as_text=True)
     df2_raw["_KEY"] = clean_key_series(raw2, treat_as_text=True)
+
+    # ✅ FIX: FREE PLAN cap applied after key cleaning, consistently:
+    #    first 100 rows of File 1 + File 2 rows with the same keys + up to 100 other File 2 rows.
+    if st.session_state.get("is_free_plan", False):
+        _f1_before, _f2_before = len(df1_raw), len(df2_raw)
+        df1_raw = df1_raw.head(100).copy()
+        _free_keys = set(df1_raw.loc[df1_raw["_KEY"] != "", "_KEY"])
+        _in_set = df2_raw["_KEY"].isin(_free_keys)
+        _keep_idx = df2_raw.index[_in_set].union(df2_raw.index[~_in_set][:100])
+        df2_raw = df2_raw.loc[df2_raw.index.isin(_keep_idx)].copy()
+        st.info(f"🆓 Free plan: using File 1 {len(df1_raw):,} of {_f1_before:,} rows and File 2 {len(df2_raw):,} of {_f2_before:,} rows.")
+
+    # ✅ NEW: warn about keys that lost digits in Excel (scientific notation) or collide after cleaning
+    for _side, _raw, _dfx in (("File 1", raw1, df1_raw), ("File 2", raw2, df2_raw)):
+        _r = _raw.reindex(_dfx.index).astype(str)
+        _sci_n = int(_r.str.match(SCI_RE).sum())
+        if _sci_n:
+            st.warning(f"⚠️ {_side}: {_sci_n:,} key value(s) look like Excel scientific notation (e.g. 1.23457E+15). "
+                       f"Digits are already lost in the file — re-export with the key column formatted as Text.")
+        _tmpk = pd.DataFrame({"k": _dfx["_KEY"], "r": _r.str.strip().str.upper()})
+        _tmpk = _tmpk[_tmpk["k"] != ""]
+        _coll = _tmpk.drop_duplicates().groupby("k").size()
+        _coll = _coll[_coll > 1]
+        if len(_coll):
+            st.warning(f"⚠️ {_side}: {len(_coll):,} cleaned key(s) come from different raw values "
+                       f"(e.g. 'AB-12' and 'AB12' both become 'AB12'). Example: {', '.join(_coll.index[:3])}")
+
+    # ✅ FIX (silent drops): rows whose key is blank/invalid in ALL key columns are reported + downloadable
+    _blank1 = df1_raw[df1_raw["_KEY"] == ""].copy()
+    _blank2 = df2_raw[df2_raw["_KEY"] == ""].copy()
+    if "Source" not in _blank1.columns:
+        _blank1.insert(0, "Source", "File1")
+    if "Source" not in _blank2.columns:
+        _blank2.insert(0, "Source", "File2")
+    blank_key_out = pd.concat([_blank1, _blank2], ignore_index=True)
+    blank_key_out = blank_key_out.loc[:, ~blank_key_out.columns.duplicated()]
+    if len(blank_key_out):
+        st.warning(f"⚠️ Blank/invalid key rows excluded from matching — File 1: {len(_blank1):,} | File 2: {len(_blank2):,}. "
+                   f"They are listed in the '🚫 Blank key rows' download and in the Summary (SNO 6).")
 
     df1_raw = df1_raw[df1_raw["_KEY"] != ""].copy()
     df2_raw = df2_raw[df2_raw["_KEY"] != ""].copy()
@@ -2037,6 +2176,8 @@ if not skip_recompute:
     # ✅ DUPLICATE HANDLING SECTION
     # ============================================================
     _has_dups = len(dup_union) > 0
+    _excl_removed_1 = df1_raw.iloc[0:0]
+    _excl_removed_2 = df2_raw.iloc[0:0]
 
     if _has_dups:
         st.warning(
@@ -2073,6 +2214,8 @@ if not skip_recompute:
             # ✅ CORRECT APPROACH: Keep only FIRST occurrence of each duplicate key
             # This removes EXTRA duplicate rows but keeps ONE row per key
             # So if a key appears 3 times → keep 1, remove 2 extra rows
+            _excl_removed_1 = df1_raw[df1_raw.duplicated(subset=["_KEY"], keep="first")]
+            _excl_removed_2 = df2_raw[df2_raw.duplicated(subset=["_KEY"], keep="first")]
             df1_raw = df1_raw.drop_duplicates(subset=["_KEY"], keep="first").copy()
             df2_raw = df2_raw.drop_duplicates(subset=["_KEY"], keep="first").copy()
 
@@ -2116,7 +2259,8 @@ if not skip_recompute:
     # -----------------------------
     progress_update(2, TOTAL_STEPS, "Aggregating duplicates (optimized) + building merged view...")
 
-    safe_compare_cols = [c for c in compare_cols if (c in df1.columns and c in df2.columns)]
+    # ✅ FIX: internal columns (_SOURCE_FILE/_SHEET) are never compared
+    safe_compare_cols = [c for c in compare_cols if (c in df1.columns and c in df2.columns) and c not in internal_cols]
     safe_compare_cols = reorder_selected_cols(safe_compare_cols)
 
     if not safe_compare_cols:
@@ -2129,21 +2273,43 @@ if not skip_recompute:
     df1_need = df1_raw[[c for c in needed_cols if c in df1_raw.columns]].copy()
     df2_need = df2_raw[[c for c in needed_cols if c in df2_raw.columns]].copy()
 
+    # ✅ FIX: a column is NUMERIC only if (a) its name is not an identifier (whole-word check) and
+    #    (b) at least 98% of the non-blank values on EACH side are numbers and none look like codes ("007").
+    #    Previously ONE numeric value was enough -> text like "B-HQ" became 0 and dates were summed.
+    _key_cols_lower = {str(k).strip().lower() for k in list(existing_key_candidates) + list(KEY_CANDIDATES_PRIORITY)}
+    def _is_key_col(c):
+        return str(c).strip().lower() in _key_cols_lower
+
     numeric_cols = []
+    _coerced_info = []
     for c in safe_compare_cols:
-        if c in KEY_CANDIDATES_PRIORITY:
+        if c in KEY_CANDIDATES_PRIORITY or _is_key_col(c):
             continue
         if is_text_by_name(c):
             continue
-
-        n1 = pd.to_numeric(df1_need[c].where(~df1_need[c].apply(is_blank), None), errors="coerce")
-        n2 = pd.to_numeric(df2_need[c].where(~df2_need[c].apply(is_blank), None), errors="coerce")
-        if (n1.notna().sum() + n2.notna().sum()) > 0:
+        _ok, _any, _bad_total = True, False, 0
+        for _d in (df1_need, df2_need):
+            _nb = ~blank_mask(_d[c])
+            _cnt = int(_nb.sum())
+            if _cnt == 0:
+                continue
+            _any = True
+            _bad = int((_nb & to_num(_d[c]).isna()).sum())
+            _codes = _d.loc[_nb, c].astype(str).str.strip().str.match(r"^0\d").any()
+            if _codes or _bad > 0.02 * _cnt:
+                _ok = False
+                break
+            _bad_total += _bad
+        if _ok and _any:
             numeric_cols.append(c)
+            if _bad_total:
+                _coerced_info.append(f"{c} ({_bad_total:,} cells)")
+    if _coerced_info:
+        st.warning("⚠️ Non-numeric cells in numeric columns are treated as 0: " + ", ".join(_coerced_info))
 
     for c in numeric_cols:
-        df1_need[c] = pd.to_numeric(df1_need[c].where(~df1_need[c].apply(is_blank), None), errors="coerce").fillna(0)
-        df2_need[c] = pd.to_numeric(df2_need[c].where(~df2_need[c].apply(is_blank), None), errors="coerce").fillna(0)
+        df1_need[c] = to_num(df1_need[c]).fillna(0)
+        df2_need[c] = to_num(df2_need[c]).fillna(0)
 
     join_cols = ["_SOURCE_FILE", "_SHEET"]
 
@@ -2171,7 +2337,7 @@ if not skip_recompute:
     # -----------------------------
     # Step 3/7: Compare by FOCUS column ONLY
     # -----------------------------
-    progress_update(3, TOTAL_STEPS, "Comparing using the selected 'Particular' column only...")
+    progress_update(3, TOTAL_STEPS, "Comparing ALL selected columns (numbers with tolerance, text exact)...")
 
     focus = reco_focus_col
     if focus in KEY_CANDIDATES_PRIORITY:
@@ -2188,27 +2354,36 @@ if not skip_recompute:
     s1 = both.get(c1n)
     s2 = both.get(c2n)
 
-    focus_is_numeric = is_numeric_column(both, focus)
+    focus_is_numeric = focus in numeric_cols
 
-    if focus_is_numeric:
-        n1 = pd.to_numeric(s1, errors="coerce")
-        n2 = pd.to_numeric(s2, errors="coerce")
-        tol = float(numeric_tolerance)
-        mismatch = (n1 - n2).abs() > (tol + 1e-9)
+    # ✅ FIX: a row is Mismatched if ANY selected compare column differs (was: Particular column only).
+    #    Numeric columns use the tolerance, text columns must be exactly equal. Key columns are skipped.
+    tol = float(numeric_tolerance)
+    _decision_cols = [c for c in safe_compare_cols if not _is_key_col(c)]
+    if focus not in _decision_cols:
+        _decision_cols = [focus] + _decision_cols
+    _mm = {}
+    for _col in _decision_cols:
+        _a = both.get(f"{_col}_f1")
+        _b = both.get(f"{_col}_f2")
+        if _a is None or _b is None:
+            continue
+        if _col in numeric_cols:
+            _m = ((to_num(_a) - to_num(_b)).abs() > (tol + 1e-9))
+        else:
+            _m = (_a.astype(str) != _b.astype(str))
         if treat_blanks_as_equal:
-            mismatch = mismatch & (~(s1.apply(is_blank).astype(bool) & s2.apply(is_blank).astype(bool)))
-    else:
-        s1s = s1.astype(str)
-        s2s = s2.astype(str)
-        mismatch = (s1s != s2s)
-        if treat_blanks_as_equal:
-            mismatch = mismatch & (~(s1.apply(is_blank).astype(bool) & s2.apply(is_blank).astype(bool)))
+            _m = _m & (~(blank_mask(_a) & blank_mask(_b)))
+        _mm[_col] = _m.astype(bool)
 
-    both["Mismatch_Count"] = mismatch.astype(int)
+    both["Mismatch_Count"] = (pd.DataFrame(_mm, index=both.index).sum(axis=1).astype(int) if _mm else 0)
     if skip_mismatch_columns:
         both["Mismatch_Columns"] = ""
     else:
-        both["Mismatch_Columns"] = focus
+        _names = pd.Series([""] * len(both), index=both.index, dtype=object)
+        for _col, _m in _mm.items():
+            _names = _names.where(~_m, _names.where(_names == "", _names + ", ") + _col)
+        both["Mismatch_Columns"] = _names
 
     matched = both[both["Mismatch_Count"] == 0].copy()
     mismatched = both[both["Mismatch_Count"] > 0].copy()
@@ -2225,12 +2400,12 @@ if not skip_recompute:
             if c1 not in df.columns or c2 not in df.columns:
                 continue
 
-            col_is_numeric = is_numeric_column(df, col)
+            col_is_numeric = col in numeric_cols   # ✅ FIX: same numeric decision as aggregation
     
             if col_is_numeric:
                 # ✅ Numeric: add Diff only (no Match column needed)
-                n1 = pd.to_numeric(df[c1], errors="coerce")
-                n2 = pd.to_numeric(df[c2], errors="coerce")
+                n1 = to_num(df[c1])
+                n2 = to_num(df[c2])
                 df[f"Diff_{col}_f1-f2"] = (n1 - n2)
             else:
                 # ✅ Text: add Match only (no Diff column — avoids #VALUE! in Excel)
@@ -2238,7 +2413,7 @@ if not skip_recompute:
                 s2x = df[c2]
                 eq = s1x.astype(str) == s2x.astype(str)
                 if treat_blanks_as_equal:
-                    eq = eq | (s1x.apply(is_blank).astype(bool) & s2x.apply(is_blank).astype(bool))
+                    eq = eq | (blank_mask(s1x) & blank_mask(s2x))
                 df[f"Match_{col}_f1=f2"] = eq
 
         return df
@@ -2269,7 +2444,7 @@ if not skip_recompute:
         compare_out_cols += [c1, c2]
 
         # ✅ FIX: only add Diff for numeric cols, only add Match for text cols
-        col_is_num = is_numeric_column(matched, col) if not matched.empty else is_numeric_column(mismatched, col) if not mismatched.empty else False
+        col_is_num = col in numeric_cols   # ✅ FIX: same numeric decision everywhere
         if col_is_num:
             if d in matched.columns:
                 compare_out_cols.append(d)
@@ -2298,12 +2473,12 @@ if not skip_recompute:
     only_f2_out = only_f2.reindex(columns=only_cols).copy()
 
     if focus_is_numeric:
-        n1 = pd.to_numeric(only_f1_out.get(f"{focus}_f1"), errors="coerce").fillna(0)
-        n2 = pd.to_numeric(only_f1_out.get(f"{focus}_f2"), errors="coerce").fillna(0)
+        n1 = to_num(only_f1_out.get(f"{focus}_f1")).fillna(0)
+        n2 = to_num(only_f1_out.get(f"{focus}_f2")).fillna(0)
         only_f1_out[diff_focus_col] = n1 - n2
 
-        n1b = pd.to_numeric(only_f2_out.get(f"{focus}_f1"), errors="coerce").fillna(0)
-        n2b = pd.to_numeric(only_f2_out.get(f"{focus}_f2"), errors="coerce").fillna(0)
+        n1b = to_num(only_f2_out.get(f"{focus}_f1")).fillna(0)
+        n2b = to_num(only_f2_out.get(f"{focus}_f2")).fillna(0)
         only_f2_out[diff_focus_col] = n1b - n2b
     else:
         only_f1_out[diff_focus_col] = ""
@@ -2315,7 +2490,7 @@ if not skip_recompute:
     progress_update(5, TOTAL_STEPS, "Preparing summary...")
 
     def sum_numeric(series):
-        return pd.to_numeric(series, errors="coerce").fillna(0).sum()
+        return to_num(series).fillna(0).sum()
 
     focus_f1 = f"{focus}_f1"
     focus_f2 = f"{focus}_f2"
@@ -2372,7 +2547,29 @@ if not skip_recompute:
             "Diff": 0.0,
             "Remarks": f"Duplicates (F1:{dup_f1_key_count:,} keys / F2:{dup_f2_key_count:,} keys) — INFO ONLY, not in Total"
         },
+        # ✅ FIX: rows that were excluded are shown so file totals can be tied out
+        {
+            "SNO": 6,
+            "Particular": focus,
+            "Count": int(len(_blank1) + len(_blank2)),
+            f"{focus}_f1": float(sum_numeric(_blank1.get(focus, pd.Series([], dtype="object")))),
+            f"{focus}_f2": float(sum_numeric(_blank2.get(focus, pd.Series([], dtype="object")))),
+            "Diff": float(sum_numeric(_blank1.get(focus, pd.Series([], dtype="object"))) -
+                          sum_numeric(_blank2.get(focus, pd.Series([], dtype="object")))),
+            "Remarks": f"Blank/invalid key rows (F1:{len(_blank1):,} / F2:{len(_blank2):,}) — EXCLUDED, not in Total"
+        },
     ]
+    if _exclude_dups:
+        summary_rows.append({
+            "SNO": 7,
+            "Particular": focus,
+            "Count": int(len(_excl_removed_1) + len(_excl_removed_2)),
+            f"{focus}_f1": float(sum_numeric(_excl_removed_1.get(focus, pd.Series([], dtype="object")))),
+            f"{focus}_f2": float(sum_numeric(_excl_removed_2.get(focus, pd.Series([], dtype="object")))),
+            "Diff": float(sum_numeric(_excl_removed_1.get(focus, pd.Series([], dtype="object"))) -
+                          sum_numeric(_excl_removed_2.get(focus, pd.Series([], dtype="object")))),
+            "Remarks": f"Extra duplicate rows removed (Exclude mode) (F1:{len(_excl_removed_1):,} / F2:{len(_excl_removed_2):,}) — not in Total"
+        })
     summary_df = pd.DataFrame(summary_rows)
 
     # ✅ FIX: Exclude SNO 5 (Duplicates) from Total — duplicates are INFO ONLY
@@ -2384,15 +2581,13 @@ if not skip_recompute:
         f"{focus}_f1": float(_summary_for_total[f"{focus}_f1"].sum()),
         f"{focus}_f2": float(_summary_for_total[f"{focus}_f2"].sum()),
         "Diff": float(_summary_for_total["Diff"].sum()),
-        "Remarks": "(Duplicates excluded from Total)"
+        "Remarks": ("Total = SNO 1-4. File total = Total + SNO 6" + (" + SNO 7" if _exclude_dups else "")
+                    + " (numeric Particular column)")
     }
     summary_df = pd.concat([summary_df, pd.DataFrame([total_row])], ignore_index=True)
 
-    out_summary_pdf = Path("summary_report_tool1.pdf")
-    build_summary_pdf(out_summary_pdf, summary_df, APP_VERSION, focus)
-
-    out_summary_pdf = Path("summary_report_tool1.pdf")
-    build_summary_pdf(out_summary_pdf, summary_df, APP_VERSION, focus)
+    # ✅ FIX: PDF built ONCE, in memory, per session (was written twice to a shared file on disk)
+    summary_pdf_bytes = build_summary_pdf(None, summary_df, APP_VERSION, focus)
 
     # ============================================================
     # ✅ BEFORE vs AFTER DUPLICATE COMPARISON TABLE
@@ -2482,7 +2677,8 @@ if not skip_recompute:
 
             # Download comparison table
             _comp_csv = _comp_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
+            if not st.session_state.get("is_free_plan", False):  # ✅ FIX: downloads are paid-only
+              st.download_button(
                 "⬇ Download Before vs After Comparison (CSV)",
                 data=_comp_csv,
                 file_name="reco_before_vs_after_dup_comparison.csv",
@@ -2527,7 +2723,7 @@ if not skip_recompute:
     k7.metric("Duplicate Keys (union)", f"{len(dup_union):,}")
 
     # ── UPGRADE POPUP FOR FREE USERS ──
-if st.session_state.get("user_plan","free") == "free":
+if st.session_state.get("is_free_plan", False):
     st.markdown("""
     <div style="background:linear-gradient(135deg,#0a1628,#0f2040);
                 border:1px solid rgba(0,212,255,0.3); border-radius:16px;
@@ -2605,6 +2801,8 @@ with tabs[7]:
     st.session_state["dup_f2_key_count"] = dup_f2_key_count
     st.session_state["_has_dups"]        = _has_dups
     st.session_state["_exclude_dups"]    = _exclude_dups
+    st.session_state["summary_pdf_bytes"] = summary_pdf_bytes
+    st.session_state["blank_key_out"] = blank_key_out
     st.session_state["miss_cols_f1"] = miss_cols_f1
     st.session_state["miss_cols_f2"] = miss_cols_f2
     st.session_state["f1_summary"] = f1_summary
@@ -2620,7 +2818,6 @@ if has_cached_run:
     k5.metric("Only in File2", f"{len(only_f2_out):,}")
     k6.metric("Duplicate Keys (union)", f"{len(pd.Index(dup_rows_1_out.get('_KEY', pd.Series([]))).unique()):,}")
     
-out_summary_pdf = Path("summary_report_tool1.pdf")
 # -----------------------------
 # Step 7/7: Download (CSV + Excel)
 # -----------------------------
@@ -2629,6 +2826,12 @@ prog.progress(100)
 label.success("✅ Completed")
 
 st.subheader("6) Download")
+
+# ✅ FIX: downloads are a paid feature (the free-plan popup already says so)
+if st.session_state.get("is_free_plan", False):
+    st.info("🔒 Downloads (CSV, Excel, ZIP and PDF) are available on paid plans. "
+            "Upgrade from the RecoSuite page or WhatsApp us to subscribe.")
+    st.stop()
 
 # ── 📦 Total Download Size Badge — covers ALL prepared files (CSV + Excel)
 #    Updates live as user prepares each file
@@ -2662,7 +2865,8 @@ st.markdown(
 )
 st.caption("Size updates as you prepare each file below.")
 
-summary_pdf_bytes = out_summary_pdf.read_bytes() if out_summary_pdf.exists() else b""
+# ✅ FIX: summary_pdf_bytes comes from this session's run (in memory), not from a shared file
+summary_pdf_bytes = summary_pdf_bytes or b""
 
 if summary_pdf_bytes:
     st.download_button(
@@ -2675,7 +2879,10 @@ if summary_pdf_bytes:
 # --------------------------------------------------
 # Stable signature for this run
 # --------------------------------------------------
+# ✅ FIX: run_sig includes ALL run settings (was row counts only -> stale downloads after changing settings)
+import hashlib
 run_sig = (
+    hashlib.md5(run_inputs_sig.encode("utf-8")).hexdigest()[:16] + "|" +
     str(len(summary_df)) + "|" +
     str(len(matched_out)) + "|" +
     str(len(mismatched_out)) + "|" +
@@ -2839,6 +3046,18 @@ with st.expander(f"🟡 Duplicates CSV  —  Unique Dup Keys: {len(dup_union):,}
             mime="text/csv",
             key="dl_dup_both_csv"
         )
+# ── 🚫 Blank key rows (✅ NEW: rows excluded because every key column was blank/invalid)
+with st.expander(f"🚫 Blank key rows CSV  —  {len(blank_key_out):,} rows (excluded from reco)", expanded=False):
+    if len(blank_key_out) == 0:
+        st.caption("No blank-key rows 🎉")
+    else:
+        st.download_button(
+            "⬇ Download Blank key rows (CSV)",
+            data=blank_key_out.to_csv(index=False).encode("utf-8"),
+            file_name="reco_blank_key_rows.csv",
+            mime="text/csv",
+            key="dl_blank_key_csv"
+        )
 # ── 📦 ZIP — One click, all CSVs
 with st.expander("📦 One-Click ZIP (All CSVs)", expanded=False):
     st.caption("Creates a single ZIP: Summary + PDF + Matched + Mismatched + Only-in File1 + Only-in File2")
@@ -2872,6 +3091,7 @@ with st.expander("📦 One-Click ZIP (All CSVs)", expanded=False):
             zf.writestr("reco_duplicates_file1.csv", b_dup1_zip)
             zf.writestr("reco_duplicates_file2.csv", b_dup2_zip)
             zf.writestr("reco_duplicates_both.csv", b_dupboth_zip)
+            zf.writestr("reco_blank_key_rows.csv", blank_key_out.to_csv(index=False).encode("utf-8"))
 
         _ep.progress(100, text="✅ ZIP ready")
         st.session_state["csv_bytes_zip_all"] = zbio.getvalue()
@@ -2902,7 +3122,7 @@ for _k, _v in [
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-@st.cache_data(show_spinner=False)
+# ✅ FIX: no global st.cache_data (shared across users, unbounded memory); bytes kept in session_state
 def _build_excel_cached(_sig: str, sheets: dict) -> bytes:
     return build_excel_bytes(sheets)
 
@@ -2940,6 +3160,7 @@ with st.expander("✅ Main Excel — Summary + Mismatched + Only-in + Duplicates
                 "Duplicate_Keys_File1": dup_rows_1_out,
                 "Duplicate_Keys_File2": dup_rows_2_out,
                 "Duplicate_Keys_BothFiles": dup_both_out,
+                "Blank_Key_Rows": blank_key_out,
             })
         _ep.progress(100, text="✅ Excel ready")
         st.session_state["excel_bytes_main"] = output_main
