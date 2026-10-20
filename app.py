@@ -32,6 +32,12 @@ try:
     rows = sheet.get_all_records(numericise_ignore=["all"])
 except TypeError:  # very old gspread without numericise_ignore
     rows = sheet.get_all_records()
+
+# ✅ v1.7.1: sheet headers are matched case/space-insensitively ('Plan', ' plan ', 'Expiry Date' -> 'expiry_date')
+import re as _re_auth
+def _norm_hdr(k) -> str:
+    return _re_auth.sub(r"[\s_]+", "_", str(k).replace("\u00A0", " ").strip().lower())
+rows = [{_norm_hdr(k): v for k, v in r.items()} for r in rows]
 user_email = st.query_params.get("email", "")
 user_pin   = st.query_params.get("pin", "")
 
@@ -73,8 +79,26 @@ if correct_pin and str(user_pin).strip() != correct_pin:
             st.error("❌ Incorrect PIN. Please check your subscription email.")
     st.stop()
 # ── PIN PASSED ──    
-plan = str(user_row.get("plan","free")).strip().lower()
+# ✅ v1.7.1: tolerant plan parsing ('Pro', ' PRO plan ', '1 Year', 'Basic - 6 months', 'Trial' ...)
+def parse_plan(raw):
+    """Returns (plan, recognised). Blank -> free. Unknown non-empty -> free + recognised=False."""
+    p = _re_auth.sub(r"\s+", " ", str(raw if raw is not None else "").replace("\u00A0", " ")).strip().lower()
+    if p in ("", "nan", "none"):
+        return "free", True
+    if any(w in p for w in ("pro", "premium", "1 year", "1 yr", "yearly", "annual", "12 month")):
+        return "pro", True
+    if any(w in p for w in ("basic", "6 month")):
+        return "basic", True
+    if "starter" in p:
+        return "starter", True
+    if any(w in p for w in ("free", "trial", "demo")):
+        return "free", True
+    return "free", False
+
+_plan_raw = user_row.get("plan", "")
+plan, _plan_ok = parse_plan(_plan_raw)
 ROW_LIMIT = {"free":100,"basic":250000,"starter":250000,"pro":9999999}.get(plan,100)  # ✅ FIX: 'basic' plan added (unknown plan names get the free limit)
+st.session_state["plan_unrecognised"] = None if _plan_ok else str(_plan_raw).strip()[:40]
 st.session_state["user_plan"] = plan
 st.session_state["row_limit"] = ROW_LIMIT
 # ── AUTH PASSED ──
@@ -140,11 +164,16 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
+# ✅ v1.7.1: unknown plan value in the subscriber sheet -> free limits + small notice
+if st.session_state.get("plan_unrecognised"):
+    st.warning(f'Plan "{st.session_state["plan_unrecognised"]}" not recognised, so Free limits apply. '
+               f'Please contact support: aarohisharma5000@gmail.com')
+
 # ============================================================
 # 🔹 App Meta + Layout (PASTE ONCE, NEVER TOUCH AGAIN)
 # ============================================================
 
-APP_VERSION  = "v1.7"
+APP_VERSION  = "v1.7.1"
 LAST_UPDATED = "2026-10-20"
 COMPANY_NAME = "RecoSuite"
 
@@ -696,42 +725,76 @@ def file_settings_ui(side_label: str, side_key: str, files) -> dict:
         st.error(f"Error reading files: {ex}")
         st.stop()
 
-    notes = []
+    # ✅ v1.7.1: work out the CURRENT selection first (from widget state, else defaults) so the
+    #    always-visible note can say which sheet(s) / header row are used for EVERY Excel file.
+    plan_ = []
     for e in entries:
         info = e["info"]
-        non_empty = [s for s in info if s["rows"] is None or s["rows"] > 0]
-        if e["ext"] != ".csv" and len(non_empty) > 1:
-            notes.append(f"📑 **{e['name']}** has {len(non_empty)} sheets with data. Choose which to use in ⚙️ settings below.")
-        for s in default_sheet_selection(info):
-            d = next(x["detected"] for x in info if x["sheet"] == s)
-            if d > 0:
-                where = "" if s == "CSV" else f" (sheet '{s}')"
-                notes.append(f"🔎 {e['name']}{where}: header detected on row {d + 1}.")
-    for n_ in notes[:6]:
+        base_key = f"{side_key}|{e['key']}"
+        non_empty = [s["sheet"] for s in info if s["rows"] is None or s["rows"] > 0]
+        default = default_sheet_selection(info)
+        picker = e["ext"] != ".csv" and len(non_empty) > 1
+        sel = default
+        if picker and f"sheets|{base_key}" in st.session_state:
+            sel = [s for s in st.session_state[f"sheets|{base_key}"] if s in non_empty]
+        hdr_now = {sh: int(st.session_state.get(f"hdr|{base_key}|{sh}",
+                                                next((x["detected"] for x in info if x["sheet"] == sh), 0) + 1))
+                   for sh in sel}
+        plan_.append((e, base_key, non_empty, default, picker, sel, hdr_now))
+
+    def _sheet_desc(e, sel, hdr_now):
+        info = {x["sheet"]: x for x in e["info"]}
+        parts = []
+        for sh in sel:
+            x = info.get(sh, {})
+            h = hdr_now.get(sh, x.get("detected", 0) + 1)
+            rows_txt = f"{x['rows']:,} rows, " if x.get("rows") is not None and h == x.get("detected", 0) + 1 else ""
+            parts.append(f"{sh} ({rows_txt}header on row {h})")
+        return "; ".join(parts)
+
+    notes = []
+    for e, base_key, non_empty, default, picker, sel, hdr_now in plan_:
+        if e["ext"] == ".csv":
+            h = hdr_now.get("CSV", 1)
+            if h != 1:
+                notes.append(f"🔎 {e['name']}: header on row {h}.")
+            continue
+        if not sel:
+            notes.append(f"📄 {e['name']}: no sheet selected (file not used).")
+            continue
+        label = "using sheet" if len(sel) == 1 else f"using {len(sel)} sheets"
+        extra = f" · {len(non_empty)} sheets with data, change in ⚙️ settings" if picker else ""
+        notes.append(f"📄 {e['name']}: {label}: {_sheet_desc(e, sel, hdr_now)}{extra}")
+    for n_ in notes[:8]:
         st.caption(n_)
-    if len(notes) > 6:
-        st.caption(f"… and {len(notes) - 6} more notes in ⚙️ settings.")
+    if len(notes) > 8:
+        st.caption(f"… and {len(notes) - 8} more files, see ⚙️ settings.")
 
     settings = {}
     with st.expander(f"⚙️ {side_label} settings: header row / sheets", expanded=False):
-        for e in entries:
+        for e, base_key, non_empty, default, picker, _sel0, _h0 in plan_:
             info = e["info"]
             det = {s["sheet"]: s["detected"] for s in info}
             rows = {s["sheet"]: s["rows"] for s in info}
-            non_empty = [s["sheet"] for s in info if s["rows"] is None or s["rows"] > 0]
-            base_key = f"{side_key}|{e['key']}"
             st.markdown(f"**{e['name']}**")
-            if e["ext"] != ".csv" and len(non_empty) > 1:
+            if picker:
                 sel = st.multiselect(
                     "Sheets to use",
                     options=non_empty,
-                    default=default_sheet_selection(info),
+                    default=default,
                     format_func=lambda s, _r=rows: f"{s} ({_r.get(s) or 0:,} rows)",
                     key=f"sheets|{base_key}",
                     help="Rows from the selected sheets are combined. Default = the largest sheet plus sheets with the same headers.",
                 )
             else:
-                sel = default_sheet_selection(info)
+                sel = default
+            if e["ext"] != ".csv":
+                if sel:
+                    st.caption(("Sheet used: " if len(sel) == 1 else "Sheets used: ")
+                               + ", ".join(f"{sh} ({rows.get(sh) or 0:,} rows)" for sh in sel)
+                               + ("" if picker else " · only sheet with data"))
+                else:
+                    st.caption("No sheet selected, so this file is not used.")
             headers = {}
             for sh in sel:
                 d1 = int(det.get(sh, 0)) + 1
