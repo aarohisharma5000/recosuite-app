@@ -1,43 +1,122 @@
-# Support form: setup (about 10 minutes, one time)
+/**
+ * RecoSuite support tickets -> Google Sheet ("Support" tab) + optional email notification.
+ * Paste this whole file into Extensions -> Apps Script of the Google Sheet that should hold the tickets.
+ * Deploy as Web app: Execute as "Me", Who has access "Anyone". See SETUP.md.
+ */
 
-You'll set up a small free Google "Apps Script" that receives each ticket, saves it in a Google Sheet,
-and emails you. No coding is needed. Just copy and paste.
+// ===================== SETTINGS (safe to change) =====================
+var SEND_EMAIL_NOTIFICATION = true;                         // false = only write to the sheet, no email
+var NOTIFY_EMAIL            = "aarohisharma5000@gmail.com";  // where new-ticket emails go
+var SHEET_NAME              = "Support";
+var MIN_TIME_MS             = 3000;                          // spam check: form filled faster than this = rejected
+var MAX_TICKETS_PER_EMAIL   = 5;                             // per email address ...
+var RATE_WINDOW_SECONDS     = 600;                           // ... per 10 minutes
+// =====================================================================
 
-## A. Create the ticket sheet and the script
-1. Go to **sheets.google.com** (signed in as aarohisharma5000@gmail.com) and create a **new blank spreadsheet**.
-   Name it **RecoSuite Support Tickets**.
-   (Use a new sheet, not the subscriber sheet, so customer emails from tickets stay separate.)
-2. In that sheet, click **Extensions → Apps Script**. A new tab opens with a file called `Code.gs`.
-3. Delete everything in that file, then **paste the whole contents of `Code.gs`** from this folder.
-4. Click the **💾 Save** icon. If asked for a project name, type **RecoSuite Support**.
-   - Optional: to turn off the email you get for each ticket, change `var SEND_EMAIL_NOTIFICATION = true;` to `false` near the top, then save.
+var HEADERS = ["Timestamp IST", "Issue ID", "Email", "Issue Type", "Description", "Status", "User Agent"];
+var ISSUE_TYPES = ["Access Issue", "Tool Error", "Wrong Results", "Download Issue", "Payment Issue",
+                   "Upgrade Request", "Feature Request", "Other"];
+var LIMITS = { email: 254, description: 5000, userAgent: 200 };
 
-## B. Publish it as a Web App
-5. Click the blue **Deploy** button (top right), then **New deployment**.
-6. Click the ⚙️ gear next to "Select type" and choose **Web app**. Fill in:
-   - Description: `Support form`
-   - **Execute as: Me** (your Gmail)
-   - **Who has access: Anyone** (not "Anyone with Google account". Customers must be able to send without logging in.)
-7. Click **Deploy**, then **Authorize access**, choose your Google account, then **Advanced → Go to RecoSuite Support (unsafe) → Allow**.
-   (Google shows this warning for every personal script. It's your own script. It asks to edit this spreadsheet and send email as you.)
-8. **Copy the Web app URL.** It looks like `https://script.google.com/macros/s/AKfy…/exec`.
-   - Check it: paste the URL into a new browser tab. You should see `{"ok":true,"service":"RecoSuite support",…}`.
+function doPost(e) {
+  try {
+    var p = (e && e.parameter) || {};
 
-## C. Connect the form
-9. Open `support.html`. Near the bottom, find this line:
-   `const APPS_SCRIPT_URL = "PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE";`
-   Replace the text between the quotes with your URL (keep the quotes), then save.
-   (Or send the URL back and it can be filled in for you.)
-10. Upload the new `support.html` to your GitHub Pages repo (the `recosuite` site), replacing the old one, and commit.
-11. **Test:** open https://aarohisharma5000.github.io/recosuite/support.html, wait a few seconds, then send a test ticket.
-    You should see "Ticket Submitted!". A new **Support** tab appears in your sheet with the ticket (time in IST, Status = Open),
-    and you get an email. Replying to that email goes straight to the customer.
+    // 1) spam checks. Honeypot filled -> pretend success, store nothing.
+    if (clean_(p.website, 200)) return json_({ ok: true });
+    var elapsed = parseInt(p.elapsedMs, 10);
+    if (!(elapsed >= MIN_TIME_MS)) return json_({ ok: false, error: "Please wait a few seconds and submit again." });
 
-## Good to know
-- **Changing the script later:** after editing `Code.gs`, go to **Deploy → Manage deployments → ✏️ Edit → Version: New version → Deploy**.
-  The URL stays the same. If you skip this, the old version keeps running.
-- **Don't** pick "New deployment" again unless you want a new URL. If you do, update `support.html`.
-- **Status column:** change "Open" to "Done" (or anything else) as you work through tickets.
-- If the script is ever unreachable, customers see a clear error with **WhatsApp** and **email** buttons that are already filled in,
-  so no ticket is lost. The page never says "submitted" unless the ticket was actually saved.
-- Spam protection: a hidden trap field plus a minimum time on the page, and at most 5 tickets per email every 10 minutes.
+    // 2) validation + length limits
+    var issueId = clean_(p.issueId, 20).toUpperCase();
+    if (!/^RS-\d{6}-[A-Z0-9]{4}$/.test(issueId)) return json_({ ok: false, error: "Invalid issue ID. Please reload the page." });
+    var email = clean_(p.email, LIMITS.email).toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return json_({ ok: false, error: "Please enter a valid email address." });
+    var issueType = clean_(p.issueType, 40);
+    if (ISSUE_TYPES.indexOf(issueType) < 0) issueType = "Other";
+    var description = clean_(p.description, LIMITS.description, true);
+    if (description.length < 10) return json_({ ok: false, error: "Please describe your issue." });
+    var userAgent = clean_(p.userAgent, LIMITS.userAgent);
+
+    // 3) simple rate limit per email
+    var cache = CacheService.getScriptCache();
+    var rateKey = "rate_" + email;
+    var count = parseInt(cache.get(rateKey) || "0", 10);
+    if (count >= MAX_TICKETS_PER_EMAIL) return json_({ ok: false, error: "Too many tickets from this email. Please try again later or use WhatsApp." });
+
+    // 4) write (locked so two tickets at the same moment don't collide)
+    var lock = LockService.getScriptLock();
+    lock.waitLock(20000);
+    var duplicate = false;
+    try {
+      var sheet = getSheet_();
+      duplicate = sheet.getLastRow() > 1 &&
+        sheet.getRange(2, 2, sheet.getLastRow() - 1, 1).createTextFinder(issueId).matchEntireCell(true).findNext() !== null;
+      if (!duplicate) {        // the same Issue ID sent twice (e.g. "Try again") is stored once
+        var ts = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
+        sheet.appendRow([ts, issueId, email, issueType, description, "Open", userAgent].map(safe_));
+      }
+    } finally {
+      lock.releaseLock();
+    }
+    if (duplicate) return json_({ ok: true, issueId: issueId, duplicate: true });
+    cache.put(rateKey, String(count + 1), RATE_WINDOW_SECONDS);
+
+    // 5) optional email notification (a mail problem never loses the ticket)
+    if (SEND_EMAIL_NOTIFICATION) {
+      try {
+        MailApp.sendEmail({
+          to: NOTIFY_EMAIL,
+          replyTo: email,
+          subject: "[RecoSuite Support] " + issueType + " — " + issueId,
+          body: "New support ticket\n\nIssue ID: " + issueId + "\nEmail: " + email + "\nIssue Type: " + issueType +
+                "\nTime (IST): " + Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm") +
+                "\nUser Agent: " + userAgent + "\n\nDescription:\n" + description +
+                "\n\n— Reply to this email to answer the customer directly."
+        });
+      } catch (mailErr) {
+        console.warn("Notification email failed: " + mailErr);
+      }
+    }
+    return json_({ ok: true, issueId: issueId });
+  } catch (err) {
+    console.error(err);
+    return json_({ ok: false, error: "Server error. Please use WhatsApp or email instead." });
+  }
+}
+
+// Opening the Web App URL in a browser shows this. Handy to check that the deployment works.
+function doGet() {
+  return json_({ ok: true, service: "RecoSuite support", hint: "POST tickets here from support.html" });
+}
+
+function getSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(SHEET_NAME);
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]).setFontWeight("bold");
+    sheet.setFrozenRows(1);
+    sheet.getRange("A:G").setNumberFormat("@");            // everything is plain text
+    sheet.setColumnWidth(5, 420);
+  }
+  return sheet;
+}
+
+// Trim, drop control characters (keep new lines in the description), cut to max length.
+function clean_(v, max, multiline) {
+  var s = String(v == null ? "" : v);
+  s = multiline ? s.replace(/\r\n?/g, "\n").replace(/[\u0000-\u0009\u000B-\u001F\u007F]/g, "")
+                : s.replace(/[\u0000-\u001F\u007F]/g, " ");
+  return s.trim().slice(0, max);
+}
+
+// Formula-injection guard: a value starting with = + - @ (or tab / CR) is stored as text.
+function safe_(v) {
+  var s = String(v);
+  return /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
+}
+
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
